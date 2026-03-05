@@ -1,178 +1,172 @@
 import * as Cesium from 'cesium'
+import { aircraftIcon, militaryIcon } from './icons.js'
 
 /**
- * Aircraft tracking via OpenSky Network REST API.
+ * Live aircraft tracking via OpenSky Network.
  *
- * OpenSky provides real-time ADS-B data from a global network of receivers.
- * Each state vector contains: ICAO24 transponder ID, callsign, origin country,
- * longitude, latitude, altitude (barometric + geometric), velocity, heading.
+ * Entities are updated IN-PLACE so viewer.trackedEntity survives refreshes.
+ * The billboard rotation is set to the aircraft's true_track heading so the
+ * icon always points in the direction of travel.
  *
- * Rate limit: ~10s for anonymous users (we respect this with our interval).
+ * Military squawk codes (7500, 7600, 7700) get a red fighter-jet icon.
  */
 
 const OPENSKY_API = 'https://opensky-network.org/api/states/all'
-const UPDATE_INTERVAL_MS = 15_000 // 15s respects OpenSky rate limits
+const UPDATE_INTERVAL_MS = 15_000
 
-// ADS-B Exchange military flight data (crowdsourced)
-// Requires API key — we include it as optional enhancement
-const ADSB_EXCHANGE_MILITARY =
-  'https://adsbexchange.com/api/aircraft/json/mil/'
-
-let aircraftEntities = []
+// icao24 → { entity, parsed state }
+const aircraftMap = new Map()
 let updateTimer = null
 let godModeActive = false
 let lastStates = []
+let visible = true
 
-/**
- * Fetch aircraft states from OpenSky.
- * Returns array of state vectors.
- */
-async function fetchAircraftStates(bounds = null) {
-  // Bounding box: {lamin, lomin, lamax, lomax}
-  // null = global (slower but more data)
-  let url = OPENSKY_API
-  if (bounds) {
-    url += `?lamin=${bounds.lamin}&lomin=${bounds.lomin}&lamax=${bounds.lamax}&lomax=${bounds.lomax}`
-  }
-
-  const resp = await fetch(url, {
-    headers: { 'Accept': 'application/json' },
-    cache: 'no-store',
-  })
-
-  if (!resp.ok) throw new Error(`OpenSky error: ${resp.status}`)
-  const data = await resp.json()
-  return data.states || []
-}
-
-/**
- * Parse a raw OpenSky state vector array into a structured object.
- * OpenSky state format (index → field):
- * [0] icao24, [1] callsign, [2] origin_country, [3] time_position,
- * [4] last_contact, [5] longitude, [6] latitude, [7] baro_altitude,
- * [8] on_ground, [9] velocity, [10] true_track, [11] vertical_rate,
- * [12] sensors, [13] geo_altitude, [14] squawk, [15] spi, [16] position_source
- */
 function parseState(s) {
   return {
-    icao24: s[0],
+    icao24:   s[0],
     callsign: (s[1] || '').trim() || s[0],
-    country: s[2] || '',
-    lon: s[5],
-    lat: s[6],
-    baroAlt: s[7] || 0,        // meters
-    geoAlt: s[13] || s[7] || 100, // meters
+    country:  s[2] || '',
+    lon:      s[5],
+    lat:      s[6],
+    baroAlt:  s[7] || 0,
+    geoAlt:   s[13] || s[7] || 100,
     onGround: s[8],
     velocity: s[9] || 0,       // m/s
-    heading: s[10] || 0,       // degrees (0=N, 90=E)
-    vertRate: s[11] || 0,      // m/s
-    squawk: s[14] || '',
+    heading:  s[10] || 0,      // true_track degrees
+    vertRate: s[11] || 0,
+    squawk:   s[14] || '',
   }
 }
 
-/**
- * Convert heading (0-360°) to a Cesium HPR orientation.
- */
-function headingToOrientation(headingDeg) {
-  return new Cesium.HeadingPitchRoll(
-    Cesium.Math.toRadians(headingDeg),
-    0,
-    0
-  )
+function isMilitary(s) {
+  // Emergency squawk codes commonly associated with military / special ops
+  return ['7500', '7600', '7700'].includes(s.squawk) ||
+    /^(RCH|JAKE|DARK|STING|GHOST|VIPER|HOOK|IRON|SWORD|VALOR)/.test(s.callsign)
 }
 
 /**
- * Render aircraft as Cesium entities.
+ * Cesium billboard rotation for a heading in degrees (0=N, 90=E).
+ * Cesium rotates counter-clockwise in screen space, so we negate.
+ * The SVG icons point "up" (North) by default.
  */
-function renderAircraft(viewer, states) {
-  // Remove old entities
-  aircraftEntities.forEach(e => viewer.entities.remove(e))
-  aircraftEntities = []
+function headingToRotation(deg) {
+  return Cesium.Math.toRadians(-deg)
+}
+
+function updateAircraft(viewer, states) {
+  const activeIds = new Set()
 
   states.forEach(raw => {
     const s = parseState(raw)
-    if (!s.lon || !s.lat) return
-    if (s.onGround) return // skip ground traffic for cleanliness
+    if (!s.lon || !s.lat || s.onGround) return
 
-    const alt = Math.max(s.geoAlt, 1000) // ensure above terrain
-    const color = godModeActive ? Cesium.Color.ORANGE : Cesium.Color.YELLOW
+    const alt = Math.max(s.geoAlt, 500)
+    const mil  = isMilitary(s)
+    const icon = mil ? militaryIcon(godModeActive) : aircraftIcon(godModeActive)
+    const color = mil
+      ? (godModeActive ? Cesium.Color.RED : Cesium.Color.fromCssColorString('#ff6666'))
+      : (godModeActive ? Cesium.Color.ORANGE : Cesium.Color.YELLOW)
+    const rotation = headingToRotation(s.heading)
+    const cart = Cesium.Cartesian3.fromDegrees(s.lon, s.lat, alt)
 
-    const entity = viewer.entities.add({
-      name: s.callsign,
-      position: Cesium.Cartesian3.fromDegrees(s.lon, s.lat, alt),
-      point: {
-        pixelSize: godModeActive ? 10 : 6,
-        color: color.withAlpha(0.9),
-        outlineColor: godModeActive ? Cesium.Color.RED : Cesium.Color.BLACK,
-        outlineWidth: godModeActive ? 2 : 1,
-        scaleByDistance: new Cesium.NearFarScalar(5e5, 2.5, 2e7, 0.3),
-      },
-      label: {
-        text: s.callsign + (s.squawk ? `\nSQK:${s.squawk}` : ''),
-        font: '9px Courier New',
-        fillColor: color,
-        outlineColor: Cesium.Color.BLACK,
-        outlineWidth: 2,
-        style: Cesium.LabelStyle.FILL_AND_OUTLINE,
-        pixelOffset: new Cesium.Cartesian2(10, -10),
-        scaleByDistance: new Cesium.NearFarScalar(5e5, 1, 5e6, 0),
-        show: godModeActive,
-      },
-      properties: {
-        type: 'aircraft',
-        callsign: s.callsign,
-        country: s.country,
-        altitude: Math.round(alt) + ' m (' + Math.round(alt / 304.8) + ' ft)',
-        speed: Math.round(s.velocity * 1.944) + ' kts',
-        heading: Math.round(s.heading) + '°',
-        vertRate: s.vertRate.toFixed(1) + ' m/s',
-        squawk: s.squawk || '--',
-        icao24: s.icao24,
-      },
-    })
+    activeIds.add(s.icao24)
 
-    aircraftEntities.push(entity)
+    if (aircraftMap.has(s.icao24)) {
+      const entry = aircraftMap.get(s.icao24)
+      entry.entity.position = new Cesium.ConstantPositionProperty(cart)
+      entry.entity.billboard.image    = new Cesium.ConstantProperty(icon)
+      entry.entity.billboard.color    = new Cesium.ConstantProperty(color.withAlpha(0.95))
+      entry.entity.billboard.rotation = new Cesium.ConstantProperty(rotation)
+      entry.entity.label.show = new Cesium.ConstantProperty(godModeActive)
+    } else {
+      const label = s.callsign + (mil ? ' ✈ MIL' : '')
+      const entity = viewer.entities.add({
+        name: s.callsign,
+        position: cart,
+        // Camera offset when tracked: 80km behind at cruise altitude
+        viewFrom: new Cesium.Cartesian3(0, -80_000, 20_000),
+        billboard: {
+          image: icon,
+          width:  mil ? 26 : 24,
+          height: mil ? 26 : 24,
+          rotation,
+          // Screen-space rotation (icon always faces camera, just spins)
+          alignedAxis: Cesium.Cartesian3.ZERO,
+          color: color.withAlpha(0.95),
+          scaleByDistance: new Cesium.NearFarScalar(5e5, 2, 2e7, 0.3),
+          disableDepthTestDistance: Number.POSITIVE_INFINITY,
+        },
+        label: {
+          text: label,
+          font: '9px Courier New',
+          fillColor: color,
+          outlineColor: Cesium.Color.BLACK,
+          outlineWidth: 2,
+          style: Cesium.LabelStyle.FILL_AND_OUTLINE,
+          pixelOffset: new Cesium.Cartesian2(14, -12),
+          scaleByDistance: new Cesium.NearFarScalar(5e5, 1, 5e6, 0),
+          show: godModeActive,
+        },
+        properties: {
+          type:     mil ? 'military_aircraft' : 'aircraft',
+          callsign: s.callsign,
+          country:  s.country,
+          altitude: Math.round(alt) + ' m (' + Math.round(alt / 304.8) + ' ft)',
+          speed:    Math.round(s.velocity * 1.944) + ' kts',
+          heading:  Math.round(s.heading) + '°',
+          vertRate: s.vertRate.toFixed(1) + ' m/s',
+          squawk:   s.squawk || '--',
+          icao24:   s.icao24,
+        },
+      })
+      aircraftMap.set(s.icao24, { entity })
+    }
   })
+
+  // Remove aircraft no longer in the feed
+  for (const [id, { entity }] of aircraftMap) {
+    if (!activeIds.has(id)) {
+      viewer.entities.remove(entity)
+      aircraftMap.delete(id)
+    }
+  }
 }
 
-/**
- * Main aircraft initializer.
- */
-export async function initAircraft(viewer) {
-  let visible = true
+async function fetchStates() {
+  const res = await fetch(OPENSKY_API, { headers: { Accept: 'application/json' }, cache: 'no-store' })
+  if (!res.ok) throw new Error(`OpenSky ${res.status}`)
+  const data = await res.json()
+  return data.states || []
+}
 
+export async function initAircraft(viewer) {
   async function update() {
     if (!visible) return
     try {
-      // Start with a broad bounding box (N America + Europe for good coverage)
-      const states = await fetchAircraftStates()
-      lastStates = states
-      renderAircraft(viewer, states)
+      lastStates = await fetchStates()
+      updateAircraft(viewer, lastStates)
     } catch (e) {
-      console.warn('[Aircraft] OpenSky fetch failed:', e.message)
-      // Keep existing entities on error
+      console.warn('[Aircraft] OpenSky failed:', e.message)
     }
   }
 
-  // Initial load
   await update()
-
-  // Schedule updates
   updateTimer = setInterval(update, UPDATE_INTERVAL_MS)
 
   return {
-    getCount: () => aircraftEntities.length,
+    getCount:   () => aircraftMap.size,
     setVisible: (v) => {
       visible = v
-      aircraftEntities.forEach(e => (e.show = v))
+      aircraftMap.forEach(({ entity }) => (entity.show = v))
     },
     setGodMode: (active) => {
       godModeActive = active
-      if (lastStates.length) renderAircraft(viewer, lastStates)
+      if (lastStates.length) updateAircraft(viewer, lastStates)
     },
     destroy: () => {
       clearInterval(updateTimer)
-      aircraftEntities.forEach(e => viewer.entities.remove(e))
+      aircraftMap.forEach(({ entity }) => viewer.entities.remove(entity))
+      aircraftMap.clear()
     },
   }
 }

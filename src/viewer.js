@@ -70,15 +70,27 @@ export async function initViewer(containerId, googleMapsKey) {
     }
   }
 
-  // Start looking down at Austin, TX
+  // ── Opening camera: descend from high orbit down to spy-satellite altitude ──
+  // Start position: 12,000 km above the US — Earth fills most of the view
   viewer.camera.setView({
-    destination: Cesium.Cartesian3.fromDegrees(-97.7431, 30.2672, 2_500_000),
-    orientation: {
-      heading: 0,
-      pitch: Cesium.Math.toRadians(-60),
-      roll: 0,
-    },
+    destination: Cesium.Cartesian3.fromDegrees(-95.0, 38.0, 12_000_000),
+    orientation: { heading: 0, pitch: Cesium.Math.toRadians(-90), roll: 0 },
   })
+
+  // After imagery loads, fly down to ~800 km spy-satellite altitude over Austin
+  // giving the feeling of a surveillance satellite descending to its target
+  setTimeout(() => {
+    viewer.camera.flyTo({
+      destination: Cesium.Cartesian3.fromDegrees(-97.7431, 30.2672, 800_000),
+      orientation: {
+        heading: Cesium.Math.toRadians(10),
+        pitch:   Cesium.Math.toRadians(-72),
+        roll:    0,
+      },
+      duration: 4.5,
+      easingFunction: Cesium.EasingFunction.CUBIC_IN_OUT,
+    })
+  }, 800)
 
   viewer.scene.postProcessStages.fxaa.enabled = true
   window._cesiumViewer = viewer

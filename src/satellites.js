@@ -1,39 +1,28 @@
 import * as Cesium from 'cesium'
 import * as satellite from 'satellite.js'
+import { satelliteIcon } from './icons.js'
 
 /**
- * Satellite tracker using CelesTrak TLE data + SGP4 propagation.
+ * Satellite tracker — CelesTrak TLE + SGP4 propagation.
  *
- * CelesTrak publishes free Two-Line Element (TLE) sets for all tracked objects.
- * The SGP4 algorithm (Simplified General Perturbations #4) propagates orbital
- * mechanics forward in time from a TLE snapshot — same math NORAD uses.
- *
- * Data flow:
- *   CelesTrak active.tle (via allorigins CORS proxy)
- *   → parseTLEText() → array of {name, satrec}
- *   → getSatPosition(satrec, Date) → {lon, lat, alt}
- *   → Cesium entities updated every UPDATE_INTERVAL_MS
+ * Key design: entities are updated IN-PLACE (position property mutated),
+ * not destroyed/recreated on each tick. This lets viewer.trackedEntity
+ * survive across position refreshes without resetting.
  */
 
-// CelesTrak active satellite TLE catalog (plain text, 3 lines per sat)
-// Fetched via allorigins.win to bypass browser CORS restrictions
 const ACTIVE_TLE_URL =
   'https://api.allorigins.win/raw?url=' +
   encodeURIComponent('https://celestrak.org/pub/TLE/active.tle')
 
-const UPDATE_INTERVAL_MS = 10_000  // 10s — sats move slowly enough
-const MAX_SATS = 180               // GPU performance ceiling
+const UPDATE_INTERVAL_MS = 10_000
+const MAX_SATS = 180
 
-let satEntities = []
+// name → { entity, satrec, line1, line2 }
+const satMap = new Map()
 let tleRecords = []
 let updateTimer = null
 let godModeActive = false
 
-/**
- * Parse plain TLE text (name / line1 / line2 triplets) into satrec objects.
- * satellite.twoline2satrec() converts TLE strings into the internal satrec
- * struct that SGP4 needs.
- */
 function parseTLEText(text) {
   const lines = text.split('\n').map(l => l.trim()).filter(Boolean)
   const records = []
@@ -43,89 +32,109 @@ function parseTLEText(text) {
     const line2 = lines[i + 2]
     if (!line1.startsWith('1 ') || !line2.startsWith('2 ')) continue
     try {
-      const satrec = satellite.twoline2satrec(line1, line2)
-      records.push({ name, satrec, line1, line2 })
-    } catch {
-      // skip malformed TLEs
-    }
+      records.push({ name, satrec: satellite.twoline2satrec(line1, line2), line1, line2 })
+    } catch { /* skip */ }
   }
   return records
 }
 
-/**
- * Propagate a satellite's satrec to the given Date and return geodetic coords.
- * Returns null if SGP4 fails (decayed orbit, bad epoch, etc.)
- */
 function getSatPosition(satrec, date) {
   const posVel = satellite.propagate(satrec, date)
   if (!posVel?.position) return null
-
-  // Rotate ECI (Earth-Centered Inertial) → geodetic using Greenwich Mean Sidereal Time
   const gmst = satellite.gstime(date)
-  const geo = satellite.eciToGeodetic(posVel.position, gmst)
-
+  const geo  = satellite.eciToGeodetic(posVel.position, gmst)
   return {
     lon: Cesium.Math.toDegrees(geo.longitude),
     lat: Cesium.Math.toDegrees(geo.latitude),
-    alt: geo.height * 1000,   // km → meters
+    alt: geo.height * 1000,
   }
 }
 
-/** Rebuild all satellite Cesium entities for the current time. */
-function renderSatellites(viewer, records, now) {
-  satEntities.forEach(e => viewer.entities.remove(e))
-  satEntities = []
+/**
+ * Update satellite positions in-place. Creates new entities for newcomers,
+ * removes entities that are no longer in the list, but never re-creates
+ * entities that already exist — preserving any active trackedEntity reference.
+ */
+function updateSatellites(viewer, records, now) {
+  const icon = satelliteIcon(godModeActive)
+  const color = godModeActive ? Cesium.Color.RED : Cesium.Color.CYAN
+
+  const activeNames = new Set()
 
   records.slice(0, MAX_SATS).forEach(({ name, satrec, line1, line2 }) => {
     const pos = getSatPosition(satrec, now)
     if (!pos) return
 
-    const entity = viewer.entities.add({
-      name,
-      position: Cesium.Cartesian3.fromDegrees(pos.lon, pos.lat, pos.alt),
-      point: {
-        pixelSize: godModeActive ? 8 : 4,
-        color: godModeActive
-          ? Cesium.Color.RED.withAlpha(0.9)
-          : Cesium.Color.CYAN.withAlpha(0.7),
-        outlineColor: godModeActive ? Cesium.Color.RED : Cesium.Color.WHITE,
-        outlineWidth: godModeActive ? 2 : 0,
-        scaleByDistance: new Cesium.NearFarScalar(1e6, 2, 1e8, 0.5),
-      },
-      label: {
-        text: name.trim(),
-        font: '10px Courier New',
-        fillColor: Cesium.Color.CYAN,
-        outlineColor: Cesium.Color.BLACK,
-        outlineWidth: 2,
-        style: Cesium.LabelStyle.FILL_AND_OUTLINE,
-        pixelOffset: new Cesium.Cartesian2(8, -8),
-        scaleByDistance: new Cesium.NearFarScalar(1e6, 1, 5e7, 0),
-        show: godModeActive,
-      },
-      properties: {
-        type: 'satellite',
-        name,
-        altitude: Math.round(pos.alt / 1000) + ' km',
-        lat: pos.lat.toFixed(4),
-        lon: pos.lon.toFixed(4),
-        line1,
-        line2,
-      },
-    })
+    activeNames.add(name)
+    const cart = Cesium.Cartesian3.fromDegrees(pos.lon, pos.lat, pos.alt)
 
-    satEntities.push(entity)
+    if (satMap.has(name)) {
+      // Update existing entity in-place
+      const entry = satMap.get(name)
+      entry.entity.position = new Cesium.ConstantPositionProperty(cart)
+      entry.entity.billboard.image = new Cesium.ConstantProperty(icon)
+      entry.entity.billboard.color = new Cesium.ConstantProperty(color.withAlpha(0.9))
+      entry.entity.label.show = new Cesium.ConstantProperty(godModeActive)
+      // Update properties
+      entry.entity.properties.altitude = new Cesium.ConstantProperty(Math.round(pos.alt / 1000) + ' km')
+      entry.entity.properties.lat      = new Cesium.ConstantProperty(pos.lat.toFixed(4))
+      entry.entity.properties.lon      = new Cesium.ConstantProperty(pos.lon.toFixed(4))
+    } else {
+      // Create new entity
+      const entity = viewer.entities.add({
+        name,
+        position: cart,
+        // Camera offset when tracked: 30km behind, 10km above the satellite
+        // viewFrom is in local ENU (East-North-Up) at the entity's surface point
+        viewFrom: new Cesium.Cartesian3(0, -30_000, 10_000),
+        billboard: {
+          image: icon,
+          width: 28, height: 28,
+          verticalOrigin: Cesium.VerticalOrigin.CENTER,
+          color: color.withAlpha(0.9),
+          scaleByDistance: new Cesium.NearFarScalar(1e6, 1.5, 1e8, 0.4),
+          disableDepthTestDistance: Number.POSITIVE_INFINITY,
+        },
+        label: {
+          text: name.trim(),
+          font: '10px Courier New',
+          fillColor: color,
+          outlineColor: Cesium.Color.BLACK,
+          outlineWidth: 2,
+          style: Cesium.LabelStyle.FILL_AND_OUTLINE,
+          pixelOffset: new Cesium.Cartesian2(18, -14),
+          scaleByDistance: new Cesium.NearFarScalar(1e6, 1, 5e7, 0),
+          show: godModeActive,
+        },
+        properties: {
+          type: 'satellite',
+          name,
+          altitude: Math.round(pos.alt / 1000) + ' km',
+          lat: pos.lat.toFixed(4),
+          lon: pos.lon.toFixed(4),
+          line1,
+          line2,
+        },
+      })
+      satMap.set(name, { entity, satrec, line1, line2 })
+    }
   })
+
+  // Remove satellites that fell out of the active set (decayed, etc.)
+  for (const [name, entry] of satMap) {
+    if (!activeNames.has(name)) {
+      viewer.entities.remove(entry.entity)
+      satMap.delete(name)
+    }
+  }
 }
 
-/** Fetch TLE catalog from CelesTrak. */
 async function fetchTLEData() {
   const res = await fetch(ACTIVE_TLE_URL, { cache: 'no-store' })
   if (!res.ok) throw new Error(`TLE fetch failed: ${res.status}`)
   return parseTLEText(await res.text())
 }
 
-/** Fallback TLE data for offline / API failure scenarios. */
 function getDemoTLEs() {
   return parseTLEText(`ISS (ZARYA)
 1 25544U 98067A   24001.50000000  .00020000  00000-0  35000-3 0  9998
@@ -144,33 +153,29 @@ TERRA
 2 25994  98.2000  70.0000 0002000  80.0000 280.0000 14.57000000 00005`)
 }
 
-/** Main satellite layer initializer. */
 export async function initSatellites(viewer) {
   try {
     tleRecords = await fetchTLEData()
-    console.log(`[Satellites] Loaded ${tleRecords.length} TLE records from CelesTrak`)
+    console.log(`[Satellites] Loaded ${tleRecords.length} TLE records`)
   } catch (e) {
-    console.warn('[Satellites] CelesTrak unavailable, using demo TLEs:', e.message)
+    console.warn('[Satellites] Using demo TLEs:', e.message)
     tleRecords = getDemoTLEs()
   }
 
-  renderSatellites(viewer, tleRecords, new Date())
-
-  updateTimer = setInterval(
-    () => renderSatellites(viewer, tleRecords, new Date()),
-    UPDATE_INTERVAL_MS
-  )
+  updateSatellites(viewer, tleRecords, new Date())
+  updateTimer = setInterval(() => updateSatellites(viewer, tleRecords, new Date()), UPDATE_INTERVAL_MS)
 
   return {
-    getCount: () => Math.min(tleRecords.length, MAX_SATS),
-    setVisible: (v) => satEntities.forEach(e => (e.show = v)),
+    getCount:   () => satMap.size,
+    setVisible: (v) => satMap.forEach(({ entity }) => (entity.show = v)),
     setGodMode: (active) => {
       godModeActive = active
-      renderSatellites(viewer, tleRecords, new Date())
+      updateSatellites(viewer, tleRecords, new Date())
     },
     destroy: () => {
       clearInterval(updateTimer)
-      satEntities.forEach(e => viewer.entities.remove(e))
+      satMap.forEach(({ entity }) => viewer.entities.remove(entity))
+      satMap.clear()
     },
   }
 }

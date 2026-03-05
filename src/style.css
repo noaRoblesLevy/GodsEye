@@ -192,6 +192,39 @@ html, body {
   50%       { box-shadow: 0 0 30px rgba(255, 34, 34, 0.8); }
 }
 
+@keyframes pulse-text {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.4; }
+}
+
+/* ── HUD action buttons (Track / Zoom) ─────────────── */
+.hud-action-btn {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--green-dim);
+  font-family: var(--font);
+  font-size: 10px;
+  letter-spacing: 1.5px;
+  padding: 5px 0;
+  cursor: pointer;
+  border-radius: 0;
+  transition: all 0.2s;
+}
+
+.hud-action-btn:hover {
+  border-color: var(--green);
+  color: var(--green);
+  box-shadow: 0 0 8px rgba(0, 255, 65, 0.3);
+}
+
+.hud-action-btn.tracking {
+  background: rgba(255, 34, 34, 0.15);
+  border-color: var(--red);
+  color: var(--red);
+  text-shadow: 0 0 6px var(--red);
+  animation: pulse-red 1.5s infinite;
+}
+
 /* Info panel */
 #info-panel {
   position: fixed;
