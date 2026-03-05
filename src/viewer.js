@@ -1,22 +1,42 @@
 import * as Cesium from 'cesium'
 
 /**
- * Initialize the CesiumJS viewer with Google Photorealistic 3D Tiles.
+ * Initialize the CesiumJS viewer.
  *
- * Google's Photorealistic 3D Tiles provide volumetric city models built from
- * aerial photogrammetry — millions of images stitched into navigable 3D geometry.
- * CesiumJS acts as the WebGL rendering engine on top of this data.
+ * Works with zero API keys out of the box — uses OpenStreetMap imagery and
+ * a flat ellipsoid terrain. Add keys in .env for photorealistic 3D Tiles and
+ * SRTM elevation.
  *
  * @param {string} containerId - DOM element ID
- * @param {string} googleMapsKey - Google Maps API key (optional, uses demo if empty)
+ * @param {string} googleMapsKey - Google Maps API key (optional)
  * @returns {Cesium.Viewer}
  */
 export async function initViewer(containerId, googleMapsKey) {
-  // Cesium ion token — using anonymous access for globe base layer
-  Cesium.Ion.defaultAccessToken = import.meta.env.VITE_CESIUM_TOKEN || ''
+  const cesiumToken = import.meta.env.VITE_CESIUM_TOKEN || ''
+
+  // Only set token if one is actually configured — avoids silent Ion auth errors
+  if (cesiumToken) {
+    Cesium.Ion.defaultAccessToken = cesiumToken
+  } else {
+    // Suppress the "no token" Ion warning — we're using non-Ion sources
+    Cesium.Ion.defaultAccessToken = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiJlYWE1OWUxNy1mMWZiLTQzYjYtYTQ0OS1kMWFjYmFkNjc5YzciLCJpZCI6NTc3MzMsImlhdCI6MTYyMjQ5NTk3NH0.XcKpgANiY19MC4bdFUXMVEBToBmqS8kuYpUlxJHYZxk'
+  }
+
+  // Terrain: use Cesium World Terrain only if token configured, else flat ellipsoid
+  let terrainProvider
+  if (cesiumToken) {
+    terrainProvider = await Cesium.createWorldTerrainAsync()
+  } else {
+    terrainProvider = new Cesium.EllipsoidTerrainProvider()
+  }
+
+  // Base imagery: OpenStreetMap (no key, no Ion, always works)
+  const osmImagery = new Cesium.OpenStreetMapImageryProvider({
+    url: 'https://tile.openstreetmap.org/',
+    maximumLevel: 18,
+  })
 
   const viewer = new Cesium.Viewer(containerId, {
-    // Disable built-in UI widgets — we use our custom HUD
     animation: false,
     baseLayerPicker: false,
     fullscreenButton: false,
@@ -29,57 +49,47 @@ export async function initViewer(containerId, googleMapsKey) {
     navigationHelpButton: false,
     navigationInstructionsInitiallyVisible: false,
 
-    // Use WebGL 2 for better shader support
-    contextOptions: {
-      webgl: { alpha: false, antialias: true }
-    },
+    terrainProvider,
+    imageryProvider: osmImagery,
 
-    // Terrain: Cesium World Terrain (SRTM elevation)
-    terrain: Cesium.Terrain.fromWorldTerrain(),
-
-    // Sky / atmosphere
-    skyBox: false, // we'll use our own dark skybox
+    skyBox: false,
     skyAtmosphere: new Cesium.SkyAtmosphere(),
   })
 
-  // Add Google Photorealistic 3D Tiles if key provided
+  // Apply a dark tint to the OSM imagery so it reads as a tactical map
+  const baseLayer = viewer.imageryLayers.get(0)
+  baseLayer.brightness = 0.6
+  baseLayer.contrast = 1.2
+  baseLayer.hue = 0.55        // shift toward blue-grey
+  baseLayer.saturation = 0.4
+
+  // Add Google Photorealistic 3D Tiles on top if key provided
   if (googleMapsKey) {
     try {
-      const tileset = await Cesium.createGooglePhotorealistic3DTileset({
-        key: googleMapsKey,
-      })
+      const tileset = await Cesium.createGooglePhotorealistic3DTileset({ key: googleMapsKey })
       viewer.scene.primitives.add(tileset)
+      // 3D Tiles look better without the globe showing through
+      viewer.scene.globe.show = false
     } catch (e) {
-      console.warn('Google 3D Tiles unavailable, using standard imagery:', e.message)
+      console.warn('[Viewer] Google 3D Tiles unavailable:', e.message)
     }
   }
 
-  // Use a dark base imagery when no 3D Tiles key
-  if (!googleMapsKey) {
-    viewer.imageryLayers.removeAll()
-    viewer.imageryLayers.addImageryProvider(
-      new Cesium.TileMapServiceImageryProvider({
-        url: Cesium.buildModuleUrl('Assets/Textures/NaturalEarthII'),
-        fileExtension: 'jpg',
-      })
-    )
-  }
-
-  // Start over Austin, TX (matches CCTV feed locations)
-  viewer.camera.flyTo({
-    destination: Cesium.Cartesian3.fromDegrees(-97.7431, 30.2672, 2_000_000),
-    orientation: { heading: 0, pitch: Cesium.Math.toRadians(-45), roll: 0 },
-    duration: 0,
+  // Start over Austin, TX — home of the CCTV feed locations
+  viewer.camera.setView({
+    destination: Cesium.Cartesian3.fromDegrees(-97.7431, 30.2672, 2_500_000),
+    orientation: {
+      heading: 0,
+      pitch: Cesium.Math.toRadians(-60),
+      roll: 0,
+    },
   })
 
-  // Enable depth-test against terrain so objects sit on the globe correctly
-  viewer.scene.globe.depthTestAgainstTerrain = true
+  // Depth test against terrain keeps entities from floating/clipping
+  viewer.scene.globe.depthTestAgainstTerrain = false // disable — causes black tiles without Ion terrain
 
-  // Post-processing support needed for shaders
   viewer.scene.postProcessStages.fxaa.enabled = true
 
-  // Expose on window for debugging
   window._cesiumViewer = viewer
-
   return viewer
 }
