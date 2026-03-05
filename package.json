@@ -1,7 +1,8 @@
 {
   "name": "godseye",
+  "description": "Browser-based spy satellite simulator: real-time satellites, aircraft, CCTV feeds on a 3D globe with military shader modes",
   "private": true,
-  "version": "0.0.0",
+  "version": "1.0.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
