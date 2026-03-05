@@ -113,10 +113,14 @@ function selectEntity(entity, viewer, shaders) {
 
   // Fly smoothly to entity, then engage tracking — avoids the instant
   // viewFrom snap that occurs when trackedEntity is set from far away.
+  // Aircraft need a close zoom (~100 km) so the orange brackets are visible;
+  // satellites are already in orbit so ~700 km gives the right perspective.
   const pos = entity.position?.getValue(viewer.clock.currentTime)
   if (pos) {
+    const isSat   = type === 'satellite'
+    const radius  = isSat ? 700_000 : 100_000
     viewer.camera.flyToBoundingSphere(
-      new Cesium.BoundingSphere(pos, 600_000),
+      new Cesium.BoundingSphere(pos, radius),
       {
         duration: 1.5,
         complete: () => { viewer.trackedEntity = entity },

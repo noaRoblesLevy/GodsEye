@@ -24,7 +24,7 @@ const ALT_REGIONS = [
 ]
 
 const UPDATE_INTERVAL_MS = 15_000
-const MAX_RENDER         = 500
+const MAX_RENDER         = 6000  // OpenSky returns ~7-10k aircraft globally; render all of them
 const MAX_TRAIL_PTS      = 4
 const FT_TO_M            = 0.3048
 
