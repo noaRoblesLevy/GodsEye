@@ -8,6 +8,13 @@ let frameCount    = 0
 let currentViewer = null
 let currentShaders = null
 
+// Aircraft tracking state — postRender lookAt keeps the plane centered every
+// frame, which (a) gives a stable top-down angle regardless of the plane's
+// direction and (b) guarantees worldToWindowCoordinates returns a valid pixel
+// so the orange selection brackets are always visible.
+let _airTrackListener = null
+let _airTrackEntity   = null
+
 export function initHUD({ viewer, shaders, satellites, aircraft, cctv }) {
   currentViewer  = viewer
   currentShaders = shaders
@@ -91,13 +98,21 @@ export function initHUD({ viewer, shaders, satellites, aircraft, cctv }) {
 
 // ── Selection / tracking ─────────────────────────────────────────────────────
 
-function selectEntity(entity, viewer, shaders) {
-  // Release any existing tracking lock before flying to new target
+function releaseTracking(viewer) {
+  // Release satellite tracking
   viewer.trackedEntity = undefined
+  // Release aircraft postRender tracking
+  if (_airTrackListener) { _airTrackListener(); _airTrackListener = null }
+  _airTrackEntity = null
+  try { viewer.camera.lookAtTransform(Cesium.Matrix4.IDENTITY) } catch (_) {}
+}
 
+function selectEntity(entity, viewer, shaders) {
+  const type = entity.properties?.type?.getValue()
+
+  releaseTracking(viewer)
   shaders.setSelectedEntity(entity)
 
-  const type = entity.properties?.type?.getValue()
   if (type === 'satellite') {
     showOrbitalTrack(viewer, entity.name)
   } else {
@@ -111,28 +126,43 @@ function selectEntity(entity, viewer, shaders) {
 
   showInfoPanel(entity)
 
-  // Fly smoothly to entity, then engage tracking — avoids the instant
-  // viewFrom snap that occurs when trackedEntity is set from far away.
-  // Aircraft need a close zoom (~100 km) so the orange brackets are visible;
-  // satellites are already in orbit so ~700 km gives the right perspective.
   const pos = entity.position?.getValue(viewer.clock.currentTime)
-  if (pos) {
-    const isSat   = type === 'satellite'
-    const radius  = isSat ? 700_000 : 100_000
+  if (!pos) { viewer.trackedEntity = entity; return }
+
+  if (type === 'satellite') {
+    // Satellites: fly in, then let Cesium track with trackedEntity.
     viewer.camera.flyToBoundingSphere(
-      new Cesium.BoundingSphere(pos, radius),
-      {
-        duration: 1.5,
-        complete: () => { viewer.trackedEntity = entity },
-      }
+      new Cesium.BoundingSphere(pos, 700_000),
+      { duration: 1.5, complete: () => { viewer.trackedEntity = entity } }
     )
   } else {
-    viewer.trackedEntity = entity
+    // Aircraft: postRender camera.lookAt keeps the plane at screen center
+    // every frame → consistent top-down angle + orange brackets always visible.
+    _airTrackEntity = entity
+    viewer.camera.flyToBoundingSphere(
+      new Cesium.BoundingSphere(pos, 100_000),
+      {
+        duration: 1.5,
+        complete: () => {
+          // Guard: if user deselected or picked a new entity during the fly, abort.
+          if (_airTrackEntity !== entity) return
+          _airTrackListener = viewer.scene.postRender.addEventListener(() => {
+            if (_airTrackEntity !== entity) return
+            const p = entity.position?.getValue(viewer.clock.currentTime)
+            if (!p) return
+            viewer.camera.lookAt(
+              p,
+              new Cesium.HeadingPitchRange(0, Cesium.Math.toRadians(-55), 100_000)
+            )
+          })
+        },
+      }
+    )
   }
 }
 
 function deselect(viewer, shaders) {
-  viewer.trackedEntity = undefined
+  releaseTracking(viewer)
   shaders.setSelectedEntity(null)
   clearOrbitalTrack(viewer)
   hideInfoPanel()

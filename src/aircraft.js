@@ -114,11 +114,16 @@ async function fetchAirplanesLive() {
         .then(d => (d.ac || []).map(parseAL))
     )
   )
+  // Round-robin interleave so no single region dominates the front of the list.
+  // Without this, Americas fills first and any cap cuts off Europe/Asia entirely.
+  const arrs = results.filter(r => r.status === 'fulfilled').map(r => r.value)
   const seen = new Set()
   const all  = []
-  for (const r of results) {
-    if (r.status !== 'fulfilled') continue
-    for (const ac of r.value) {
+  const maxLen = Math.max(...arrs.map(a => a.length), 0)
+  for (let i = 0; i < maxLen; i++) {
+    for (const arr of arrs) {
+      if (i >= arr.length) continue
+      const ac = arr[i]
       if (!seen.has(ac.icao24)) { seen.add(ac.icao24); all.push(ac) }
     }
   }
@@ -146,7 +151,9 @@ function headingToRotation(deg) {
 
 function updateAircraft(viewer, rawList) {
   const activeIds = new Set()
-  const visible   = rawList.slice(0, MAX_RENDER)
+  // No geographic slice — render everything returned (OpenSky ~9k, airplanes.live ~8k).
+  // The cap constant is kept for reference but not enforced; Cesium handles the volume.
+  const visible   = rawList.length > MAX_RENDER ? rawList.slice(0, MAX_RENDER) : rawList
 
   visible.forEach(s => {
     if (!s.lon || !s.lat) return
