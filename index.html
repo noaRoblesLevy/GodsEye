@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>God's Eye — Spatial Intelligence Simulator</title>
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <!-- CesiumJS 3D globe container -->
+    <div id="cesiumContainer"></div>
+
+    <!-- HUD Overlay -->
+    <div id="hud">
+      <div id="hud-header">
+        <span id="hud-title">GOD'S EYE // WORLDVIEW</span>
+        <span id="hud-time"></span>
+      </div>
+
+      <!-- Vision mode selector -->
+      <div id="vision-panel">
+        <div class="panel-label">VISION MODE</div>
+        <div id="vision-buttons">
+          <button class="vision-btn active" data-mode="normal">NORMAL</button>
+          <button class="vision-btn" data-mode="nightvision">NVG</button>
+          <button class="vision-btn" data-mode="thermal">FLIR</button>
+          <button class="vision-btn" data-mode="crt">CRT</button>
+          <button class="vision-btn" data-mode="anime">ANIME</button>
+        </div>
+      </div>
+
+      <!-- Data layer toggles -->
+      <div id="layers-panel">
+        <div class="panel-label">DATA LAYERS</div>
+        <label class="layer-toggle">
+          <input type="checkbox" id="toggle-satellites" checked />
+          <span>SATELLITES (CelesTrak)</span>
+          <span class="layer-count" id="sat-count">0</span>
+        </label>
+        <label class="layer-toggle">
+          <input type="checkbox" id="toggle-aircraft" checked />
+          <span>AIRCRAFT (OpenSky)</span>
+          <span class="layer-count" id="air-count">0</span>
+        </label>
+        <label class="layer-toggle">
+          <input type="checkbox" id="toggle-traffic" />
+          <span>VEHICLES (OSM)</span>
+        </label>
+        <label class="layer-toggle">
+          <input type="checkbox" id="toggle-cctv" />
+          <span>CCTV FEEDS (Austin)</span>
+          <span class="layer-count" id="cctv-count">0</span>
+        </label>
+      </div>
+
+      <!-- God Mode -->
+      <div id="god-mode-panel">
+        <button id="god-mode-btn">&#x2B21; GOD MODE</button>
+      </div>
+
+      <!-- Info panel for selected entity -->
+      <div id="info-panel" class="hidden">
+        <div id="info-title"></div>
+        <div id="info-body"></div>
+        <button id="info-close">&#x2715;</button>
+      </div>
+
+      <!-- Stats bar -->
+      <div id="stats-bar">
+        <span id="stat-lat">LAT: --</span>
+        <span id="stat-lon">LON: --</span>
+        <span id="stat-alt">ALT: --</span>
+        <span id="stat-fps">FPS: --</span>
+      </div>
+    </div>
+
+    <!-- Shader canvas overlay (post-processing) -->
+    <canvas id="shader-overlay"></canvas>
+
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
