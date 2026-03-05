@@ -2,12 +2,11 @@ import * as Cesium from 'cesium'
 import { aircraftIcon, militaryIcon } from './icons.js'
 
 /**
- * Aircraft tracking — OpenSky Network.
+ * Aircraft tracking — OpenSky Network (global feed).
  *
- * Performance:
- *  - Bounding box limited to N America + Europe (keeps count ~300 vs 7000+ global)
- *  - Entities updated IN-PLACE (no destroy/recreate) to preserve trackedEntity
- *  - disableDepthTestDistance: 1.5e6 — entities on far side of globe are occluded
+ * Performance strategy: fetch all ~7000 global states but only render
+ * the first MAX_RENDER with valid positions. In-place entity updates
+ * avoid destroy/recreate overhead so trackedEntity survives refreshes.
  *
  * Flight trails:
  *  - Last 4 positions per aircraft stored in positionHistory
@@ -17,10 +16,8 @@ import { aircraftIcon, militaryIcon } from './icons.js'
 const OPENSKY_API = 'https://opensky-network.org/api/states/all'
 const UPDATE_INTERVAL_MS = 15_000
 
-// Bounding box: covers continental US + most of Europe
-const BBOX = { lamin: 20, lomin: -130, lamax: 65, lomax: 45 }
-const BBOX_QUERY = `?lamin=${BBOX.lamin}&lomin=${BBOX.lomin}&lamax=${BBOX.lamax}&lomax=${BBOX.lomax}`
-
+// Render cap — beyond this Cesium draw-call count hurts frame rate
+const MAX_RENDER = 500
 const MAX_TRAIL_POINTS = 4
 
 // icao24 → { entity }
@@ -62,7 +59,12 @@ function headingToRotation(deg) {
 function updateAircraft(viewer, states) {
   const activeIds = new Set()
 
-  states.forEach(raw => {
+  // Filter airborne planes with valid positions, cap to MAX_RENDER
+  const visible = states
+    .filter(raw => raw[5] != null && raw[6] != null && !raw[8])
+    .slice(0, MAX_RENDER)
+
+  visible.forEach(raw => {
     const s = parseState(raw)
     if (!s.lon || !s.lat || s.onGround) return
 
@@ -143,7 +145,7 @@ function updateAircraft(viewer, states) {
 }
 
 async function fetchStates() {
-  const res = await fetch(OPENSKY_API + BBOX_QUERY, {
+  const res = await fetch(OPENSKY_API, {
     headers: { Accept: 'application/json' },
     cache: 'no-store',
   })
