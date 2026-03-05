@@ -1,12 +1,16 @@
 import * as Cesium from 'cesium'
 import { vehicleIcon } from './icons.js'
+import { showOrbitalTrack, clearOrbitalTrack } from './satellites.js'
 
-let godModeActive   = false
-let trackedEntity   = null   // entity currently being tracked
-let lastFrameTime   = performance.now()
-let frameCount      = 0
+let godModeActive = false
+let lastFrameTime = performance.now()
+let frameCount    = 0
+let currentViewer = null
+let currentShaders = null
 
 export function initHUD({ viewer, shaders, satellites, aircraft, cctv }) {
+  currentViewer  = viewer
+  currentShaders = shaders
 
   // ── Vision mode buttons ──────────────────────────────────────────────────
   document.querySelectorAll('.vision-btn').forEach(btn => {
@@ -35,19 +39,22 @@ export function initHUD({ viewer, shaders, satellites, aircraft, cctv }) {
     document.body.classList.toggle('god-mode', godModeActive)
   })
 
-  // ── Entity selection → Info panel + tracking ─────────────────────────────
+  // ── Entity selection → auto-track + info panel ──────────────────────────
   viewer.selectedEntityChanged.addEventListener(entity => {
-    if (!entity || !entity.properties?.type) {
-      hideInfoPanel()
+    if (!entity || !entity.properties?.type?.getValue()) {
+      // Clicked empty space — deselect everything
+      deselect(viewer, shaders)
       return
     }
-    showInfoPanel(entity, viewer)
+    selectEntity(entity, viewer, shaders)
   })
 
-  document.getElementById('info-close').addEventListener('click', () => {
-    stopTracking(viewer)
-    viewer.selectedEntity = undefined
-    hideInfoPanel()
+  // Escape key to deselect
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape') {
+      viewer.selectedEntity = undefined
+      deselect(viewer, shaders)
+    }
   })
 
   // ── Stats bar ─────────────────────────────────────────────────────────────
@@ -82,18 +89,54 @@ export function initHUD({ viewer, shaders, satellites, aircraft, cctv }) {
   document.getElementById('cctv-count').textContent = cctv.getCount()
 }
 
+// ── Selection / tracking ─────────────────────────────────────────────────────
+
+function selectEntity(entity, viewer, shaders) {
+  // Auto-track the entity immediately
+  viewer.trackedEntity = entity
+  shaders.setSelectedEntity(entity)
+
+  // Show orbital track for satellites
+  const type = entity.properties?.type?.getValue()
+  if (type === 'satellite') {
+    showOrbitalTrack(viewer, entity.name)
+  } else {
+    clearOrbitalTrack(viewer)
+  }
+
+  // Update HUD title
+  const title = document.getElementById('hud-title')
+  title.textContent = `TRACKING: ${entity.name || 'TARGET'}`
+  title.style.color     = '#ff8800'
+  title.style.animation = 'pulse-text 1.2s infinite'
+
+  showInfoPanel(entity)
+}
+
+function deselect(viewer, shaders) {
+  viewer.trackedEntity = undefined
+  shaders.setSelectedEntity(null)
+  clearOrbitalTrack(viewer)
+  hideInfoPanel()
+
+  const title = document.getElementById('hud-title')
+  title.textContent     = "GOD'S EYE // WORLDVIEW"
+  title.style.color     = ''
+  title.style.animation = ''
+}
+
 // ── Info panel ───────────────────────────────────────────────────────────────
 
-function showInfoPanel(entity, viewer) {
+function showInfoPanel(entity) {
   const props = entity.properties
-  const type  = props.type?.getValue() || 'unknown'
+  const type  = props?.type?.getValue() || 'unknown'
   const name  = entity.name || 'UNKNOWN'
 
-  document.getElementById('info-title').textContent = `[${type.toUpperCase().replace('_', ' ')}] ${name}`
+  document.getElementById('info-title').textContent =
+    `[${type.toUpperCase().replace('_', ' ')}] ${name}`
 
-  // Property rows
   const rows = []
-  ;(props.propertyNames || []).forEach(key => {
+  ;(props?.propertyNames || []).forEach(key => {
     if (key === 'type') return
     const val = props[key]?.getValue()
     if (val != null) rows.push(
@@ -101,7 +144,6 @@ function showInfoPanel(entity, viewer) {
     )
   })
 
-  // CCTV live feed thumbnail
   if (type === 'cctv') {
     const url = props.feedUrl?.getValue()
     if (url) {
@@ -113,99 +155,57 @@ function showInfoPanel(entity, viewer) {
     }
   }
 
-  // Track / untrack button (not for CCTV — it doesn't move)
-  if (type !== 'cctv') {
-    const isTracking = trackedEntity === entity
-    rows.push(`
-      <div style="margin-top:10px;display:flex;gap:6px;">
-        <button id="track-btn" class="hud-action-btn${isTracking ? ' tracking' : ''}"
-          style="flex:1">${isTracking ? '⊠ STOP TRACK' : '⊕ TRACK'}</button>
-        <button id="zoom-btn" class="hud-action-btn" style="flex:1">⊙ ZOOM TO</button>
-      </div>`)
-  }
+  // Hint for escape
+  rows.push(`<div style="margin-top:10px;font-size:9px;color:rgba(0,255,65,0.35);letter-spacing:1px">
+    ESC or click away to deselect
+  </div>`)
 
   document.getElementById('info-body').innerHTML = rows.join('')
   document.getElementById('info-panel').classList.remove('hidden')
-
-  // Wire buttons after inserting into DOM
-  document.getElementById('track-btn')?.addEventListener('click', () => {
-    if (trackedEntity === entity) {
-      stopTracking(viewer)
-    } else {
-      startTracking(entity, viewer)
-    }
-    // Refresh info panel to reflect new state
-    showInfoPanel(entity, viewer)
-  })
-
-  document.getElementById('zoom-btn')?.addEventListener('click', () => {
-    viewer.zoomTo(entity, new Cesium.HeadingPitchRange(0, Cesium.Math.toRadians(-60), 500_000))
-  })
-}
-
-function startTracking(entity, viewer) {
-  trackedEntity = entity
-  viewer.trackedEntity = entity
-
-  // Show tracking indicator in HUD title
-  const titleEl = document.getElementById('hud-title')
-  titleEl.textContent = `TRACKING: ${entity.name || 'TARGET'}`
-  titleEl.style.color = '#ff4444'
-  titleEl.style.animation = 'pulse-text 1s infinite'
-}
-
-function stopTracking(viewer) {
-  trackedEntity = null
-  viewer.trackedEntity = undefined
-
-  const titleEl = document.getElementById('hud-title')
-  titleEl.textContent = "GOD'S EYE // WORLDVIEW"
-  titleEl.style.color = ''
-  titleEl.style.animation = ''
 }
 
 function hideInfoPanel() {
   document.getElementById('info-panel').classList.add('hidden')
 }
 
-// ── Vehicle particle system ───────────────────────────────────────────────────
+// ── Vehicle particles ─────────────────────────────────────────────────────────
 
 let vehicleParticles = []
 let vehicleTimer     = null
-const ICON = vehicleIcon()
+const VEHICLE_ICON = vehicleIcon()
 
 function initVehicleParticles(viewer) {
   const center = { lon: -97.7431, lat: 30.2672 }
   const spread = 0.05
 
   for (let i = 0; i < 200; i++) {
-    const lon   = center.lon + (Math.random() - 0.5) * spread * 2
-    const lat   = center.lat + (Math.random() - 0.5) * spread * 2
-    const speed = 0.000008 + Math.random() * 0.00002
-    const dir   = Math.random() < 0.5 ? 1 : -1
-    const axis  = Math.random() < 0.5 ? 'lon' : 'lat'
+    const lon  = center.lon + (Math.random() - 0.5) * spread * 2
+    const lat  = center.lat + (Math.random() - 0.5) * spread * 2
+    const spd  = 0.000008 + Math.random() * 0.00002
+    const dir  = Math.random() < 0.5 ? 1 : -1
+    const axis = Math.random() < 0.5 ? 'lon' : 'lat'
 
     const entity = viewer.entities.add({
       position: Cesium.Cartesian3.fromDegrees(lon, lat, 2),
       billboard: {
-        image: ICON,
+        image: VEHICLE_ICON,
         width: 10, height: 10,
-        disableDepthTestDistance: Number.POSITIVE_INFINITY,
+        disableDepthTestDistance: 5e4, // only visible when camera is within 50km
         scaleByDistance: new Cesium.NearFarScalar(500, 2, 50_000, 0),
       },
-      properties: { type: 'vehicle', speed: Math.round(speed * 3_600_000) + ' km/h' },
+      properties: { type: 'vehicle' },
     })
 
-    vehicleParticles.push({ entity, lon, lat, speed, dir, axis })
+    vehicleParticles.push({ entity, lon, lat, spd, dir, axis })
   }
 
   vehicleTimer = setInterval(() => {
     vehicleParticles.forEach(v => {
       if (v.axis === 'lon') {
-        v.lon += v.speed * v.dir
+        v.lon += v.spd * v.dir
         if (Math.abs(v.lon - center.lon) > spread) v.dir *= -1
       } else {
-        v.lat += v.speed * v.dir
+        v.lat += v.spd * v.dir
         if (Math.abs(v.lat - center.lat) > spread) v.dir *= -1
       }
       v.entity.position = Cesium.Cartesian3.fromDegrees(v.lon, v.lat, 2)

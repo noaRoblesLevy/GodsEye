@@ -1,228 +1,270 @@
 /**
- * Post-processing shader effects for God's Eye.
+ * Post-processing overlay — canvas2D drawn on top of the CesiumJS scene.
  *
- * Architecture: CSS filters handle the broad color transformation (NVG green,
- * FLIR heat palette, anime saturation). A Canvas2D overlay renders frame-by-frame
- * effects that CSS can't express: CRT scanlines, phosphor glow, targeting reticle.
- *
- * Modes:
- *  - normal     : no effect
- *  - nightvision: NVG green amplification + noise + phosphor glow
- *  - thermal    : FLIR heat palette (CSS hue-rotate + canvas gradient lut)
- *  - crt        : CRT scanlines + barrel distortion simulation
- *  - anime      : Cel-shading edge detection outline
+ * Responsibilities:
+ *  1. Vision mode effects (NVG, FLIR, CRT scanlines, Anime) via CSS filters + canvas
+ *  2. Orange targeting brackets on the selected entity (screen-space projection)
+ *  3. Aircraft flight trail lines (project positionHistory → screen → draw)
  */
 
+import * as Cesium from 'cesium'
+
 const canvas = document.getElementById('shader-overlay')
-const ctx = canvas.getContext('2d')
+const ctx    = canvas.getContext('2d')
 
-let currentMode = 'normal'
-let animFrameId = null
-let godMode = false
+let currentMode     = 'normal'
+let animFrameId     = null
+let godMode         = false
+let selectedEntity  = null    // current Cesium entity being tracked
+let cesiumViewer    = null    // set by initShaders
+let getTrailsFn     = null    // () => Map<id, Cartesian3[]>
 
-/** Resize canvas to match viewport */
 function resizeCanvas() {
-  canvas.width = window.innerWidth
+  canvas.width  = window.innerWidth
   canvas.height = window.innerHeight
 }
 
-/** Draw CRT scanlines across the entire canvas */
-function drawCRTScanlines() {
-  const { width, height } = canvas
-  ctx.clearRect(0, 0, width, height)
+// ── Vision effects ────────────────────────────────────────────────────────────
 
-  // Horizontal scanlines every 3px
-  ctx.fillStyle = 'rgba(0, 0, 0, 0.25)'
-  for (let y = 0; y < height; y += 3) {
-    ctx.fillRect(0, y, width, 1)
-  }
-
-  // Vignette (dark corners)
-  const vignette = ctx.createRadialGradient(
-    width / 2, height / 2, height * 0.3,
-    width / 2, height / 2, height * 0.85
-  )
-  vignette.addColorStop(0, 'rgba(0,0,0,0)')
-  vignette.addColorStop(1, 'rgba(0,0,0,0.6)')
-  ctx.fillStyle = vignette
-  ctx.fillRect(0, 0, width, height)
-
-  // Subtle horizontal flicker line (moves slowly)
-  const flickerY = (Date.now() / 20) % height
-  ctx.fillStyle = 'rgba(255,255,255,0.03)'
-  ctx.fillRect(0, flickerY, width, 2)
-
-  // Corner timestamp
-  ctx.font = '11px Courier New'
-  ctx.fillStyle = 'rgba(0,255,65,0.6)'
-  ctx.fillText('REC ● ' + new Date().toISOString().replace('T', ' ').slice(0, 19), 14, height - 14)
-}
-
-/** Draw Night Vision phosphor glow + noise */
 function drawNightVision() {
   const { width, height } = canvas
   ctx.clearRect(0, 0, width, height)
 
-  // Film grain / sensor noise
-  const imageData = ctx.createImageData(width, height)
-  const data = imageData.data
-  for (let i = 0; i < data.length; i += 4) {
-    const noise = (Math.random() - 0.5) * 40
-    data[i] = 0
-    data[i + 1] = Math.max(0, noise)
-    data[i + 2] = 0
-    data[i + 3] = 12 // very subtle
+  // Film grain
+  const id = ctx.createImageData(width, height)
+  const d  = id.data
+  for (let i = 0; i < d.length; i += 4) {
+    const n = (Math.random() - 0.5) * 35
+    d[i] = 0; d[i+1] = Math.max(0, n); d[i+2] = 0; d[i+3] = 10
   }
-  ctx.putImageData(imageData, 0, 0)
+  ctx.putImageData(id, 0, 0)
 
-  // Circular vignette (NVG tube shape)
-  const vignette = ctx.createRadialGradient(
-    width / 2, height / 2, Math.min(width, height) * 0.38,
-    width / 2, height / 2, Math.min(width, height) * 0.55
-  )
-  vignette.addColorStop(0, 'rgba(0,0,0,0)')
-  vignette.addColorStop(1, 'rgba(0,0,0,0.92)')
-  ctx.fillStyle = vignette
+  // NVG tube vignette (circular, hard edge)
+  const r = Math.min(width, height) * 0.46
+  const vign = ctx.createRadialGradient(width/2, height/2, r * 0.82, width/2, height/2, r)
+  vign.addColorStop(0, 'rgba(0,0,0,0)')
+  vign.addColorStop(1, 'rgba(0,0,0,0.98)')
+  ctx.fillStyle = vign
   ctx.fillRect(0, 0, width, height)
 
-  // HUD reticle center cross
-  drawReticle(width / 2, height / 2, 'rgba(0,255,65,0.5)')
-
-  // Timestamp + GAIN label
-  ctx.font = '11px Courier New'
-  ctx.fillStyle = 'rgba(0,255,65,0.7)'
-  ctx.fillText('NVG MODE | GAIN: AUTO', 14, 20)
-  ctx.fillText(new Date().toUTCString().slice(0, 25) + ' UTC', 14, height - 14)
+  drawReticle(width/2, height/2, 'rgba(0,255,65,0.45)')
+  drawHUDText(`NVG MODE | GAIN: AUTO`, 14, 20, 'rgba(0,255,65,0.7)')
+  drawHUDText(utcNow(), 14, height - 14, 'rgba(0,255,65,0.5)')
 }
 
-/** Draw FLIR thermal overlay effects */
 function drawThermal() {
   const { width, height } = canvas
   ctx.clearRect(0, 0, width, height)
 
-  // Color scale legend (bottom right) — shows FLIR palette
-  const legendX = width - 30
-  const legendH = 120
-  const legendY = height / 2 - legendH / 2
-  const grad = ctx.createLinearGradient(0, legendY, 0, legendY + legendH)
-  grad.addColorStop(0, 'white')
-  grad.addColorStop(0.2, 'yellow')
-  grad.addColorStop(0.5, 'red')
-  grad.addColorStop(0.8, 'purple')
-  grad.addColorStop(1, 'black')
-  ctx.fillStyle = grad
-  ctx.fillRect(legendX, legendY, 14, legendH)
-  ctx.strokeStyle = 'rgba(255,255,255,0.4)'
-  ctx.lineWidth = 1
-  ctx.strokeRect(legendX, legendY, 14, legendH)
-
+  // Palette legend
+  const lx = width - 28, lh = 130, ly = height/2 - lh/2
+  const g = ctx.createLinearGradient(0, ly, 0, ly + lh)
+  g.addColorStop(0,   'white')
+  g.addColorStop(0.25,'yellow')
+  g.addColorStop(0.5, 'red')
+  g.addColorStop(0.75,'purple')
+  g.addColorStop(1,   'black')
+  ctx.fillStyle = g
+  ctx.fillRect(lx, ly, 12, lh)
+  ctx.strokeStyle = 'rgba(255,255,255,0.35)'
+  ctx.lineWidth = 0.8
+  ctx.strokeRect(lx, ly, 12, lh)
   ctx.font = '9px Courier New'
-  ctx.fillStyle = 'rgba(255,255,255,0.6)'
-  ctx.fillText('HOT', legendX - 4, legendY - 4)
-  ctx.fillText('COLD', legendX - 6, legendY + legendH + 12)
+  ctx.fillStyle = 'rgba(255,255,255,0.55)'
+  ctx.fillText('HOT',  lx - 4, ly - 4)
+  ctx.fillText('COLD', lx - 6, ly + lh + 12)
 
-  // Targeting reticle center
-  drawReticle(width / 2, height / 2, 'rgba(255,165,0,0.5)')
-
-  // Labels
-  ctx.font = '11px Courier New'
-  ctx.fillStyle = 'rgba(255,165,0,0.8)'
-  ctx.fillText('FLIR THERMAL | SENSITIVITY: HIGH', 14, 20)
-  ctx.fillText('TEMP RANGE: -20°C to +60°C', 14, 34)
+  drawReticle(width/2, height/2, 'rgba(255,165,0,0.5)')
+  drawHUDText('FLIR THERMAL | SENSITIVITY: HIGH', 14, 20, 'rgba(255,165,0,0.8)')
 }
 
-/** Draw anime cel-shading edge hint overlay */
-function drawAnime() {
+function drawCRT() {
   const { width, height } = canvas
   ctx.clearRect(0, 0, width, height)
 
-  // Soft colored vignette — warm tones for Studio Ghibli feel
-  const vignette = ctx.createRadialGradient(
-    width / 2, height / 2, height * 0.2,
-    width / 2, height / 2, height * 0.8
-  )
-  vignette.addColorStop(0, 'rgba(255,240,200,0)')
-  vignette.addColorStop(1, 'rgba(100,60,20,0.3)')
-  ctx.fillStyle = vignette
+  // Scanlines every 3px
+  ctx.fillStyle = 'rgba(0,0,0,0.22)'
+  for (let y = 0; y < height; y += 3) ctx.fillRect(0, y, width, 1)
+
+  // Vignette
+  const vign = ctx.createRadialGradient(width/2, height/2, height*0.28, width/2, height/2, height*0.82)
+  vign.addColorStop(0, 'rgba(0,0,0,0)')
+  vign.addColorStop(1, 'rgba(0,0,0,0.65)')
+  ctx.fillStyle = vign
+  ctx.fillRect(0, 0, width, height)
+
+  // Slow horizontal flicker line
+  const fy = (Date.now() / 18) % height
+  ctx.fillStyle = 'rgba(255,255,255,0.025)'
+  ctx.fillRect(0, fy, width, 2)
+
+  drawHUDText(`REC ● ${utcNow()}`, 14, height - 14, 'rgba(0,255,65,0.55)')
+}
+
+function drawAnime() {
+  const { width, height } = canvas
+  ctx.clearRect(0, 0, width, height)
+  const vign = ctx.createRadialGradient(width/2, height/2, height*0.22, width/2, height/2, height*0.78)
+  vign.addColorStop(0, 'rgba(255,240,200,0)')
+  vign.addColorStop(1, 'rgba(100,60,20,0.28)')
+  ctx.fillStyle = vign
   ctx.fillRect(0, 0, width, height)
 }
 
-/** Draw a military targeting reticle */
 function drawReticle(cx, cy, color) {
   ctx.strokeStyle = color
   ctx.lineWidth = 1
-
-  const r = 40
-  const gap = 10
-
+  const r = 42, gap = 10
   ctx.beginPath()
-  // Top
-  ctx.moveTo(cx, cy - gap)
-  ctx.lineTo(cx, cy - r)
-  // Bottom
-  ctx.moveTo(cx, cy + gap)
-  ctx.lineTo(cx, cy + r)
-  // Left
-  ctx.moveTo(cx - gap, cy)
-  ctx.lineTo(cx - r, cy)
-  // Right
-  ctx.moveTo(cx + gap, cy)
-  ctx.lineTo(cx + r, cy)
+  ctx.moveTo(cx, cy - gap); ctx.lineTo(cx, cy - r)
+  ctx.moveTo(cx, cy + gap); ctx.lineTo(cx, cy + r)
+  ctx.moveTo(cx - gap, cy); ctx.lineTo(cx - r, cy)
+  ctx.moveTo(cx + gap, cy); ctx.lineTo(cx + r, cy)
   ctx.stroke()
-
-  // Outer circle
   ctx.beginPath()
-  ctx.arc(cx, cy, r * 1.2, 0, Math.PI * 2)
+  ctx.arc(cx, cy, r * 1.18, 0, Math.PI * 2)
   ctx.stroke()
-
-  // Inner dot
-  ctx.fillStyle = color
-  ctx.beginPath()
-  ctx.arc(cx, cy, 2, 0, Math.PI * 2)
-  ctx.fill()
 }
 
-/** God Mode detection grid (red bounding boxes over the scene) */
-function drawGodModeOverlay() {
+function drawHUDText(text, x, y, color) {
+  ctx.font = '11px Courier New'
+  ctx.fillStyle = color
+  ctx.fillText(text, x, y)
+}
+
+function utcNow() {
+  return new Date().toUTCString().slice(0, 25) + ' UTC'
+}
+
+// ── God mode border ───────────────────────────────────────────────────────────
+
+function drawGodModeBorder() {
   if (!godMode) return
   const { width, height } = canvas
-
-  // Red frame border
-  ctx.strokeStyle = 'rgba(255,0,0,0.5)'
+  ctx.strokeStyle = 'rgba(255,0,0,0.45)'
   ctx.lineWidth = 3
   ctx.setLineDash([8, 4])
   ctx.strokeRect(4, 4, width - 8, height - 8)
   ctx.setLineDash([])
-
-  // "PANOPTIC MODE" label
-  ctx.font = 'bold 12px Courier New'
-  ctx.fillStyle = 'rgba(255,0,0,0.85)'
-  ctx.fillText('⬡ PANOPTIC MODE ACTIVE', 14, height - 30)
-  ctx.font = '10px Courier New'
-  ctx.fillStyle = 'rgba(255,80,80,0.7)'
-  ctx.fillText('ALL TARGETS TRACKED', 14, height - 14)
+  drawHUDText('⬡ PANOPTIC MODE ACTIVE', 14, height - 30, 'rgba(255,0,0,0.85)')
+  drawHUDText('ALL TARGETS TRACKED', 14, height - 14, 'rgba(255,80,80,0.7)')
 }
 
-/** Animation loop — redraws overlay at 30fps */
+// ── Aircraft trail lines ──────────────────────────────────────────────────────
+
+function drawTrails() {
+  if (!cesiumViewer || !getTrailsFn) return
+  const scene  = cesiumViewer.scene
+  const trails = getTrailsFn()
+
+  trails.forEach((history) => {
+    if (history.length < 2) return
+
+    // Project each world position to screen coordinates
+    const pts = []
+    for (const cart of history) {
+      const sc = Cesium.SceneTransforms.worldToWindowCoordinates(scene, cart)
+      if (sc) pts.push(sc)
+    }
+    if (pts.length < 2) return
+
+    ctx.lineWidth = 1
+    for (let i = 1; i < pts.length; i++) {
+      // Fade opacity: most recent segment is brightest
+      const alpha = 0.15 + (i / pts.length) * 0.35
+      ctx.strokeStyle = `rgba(255,230,80,${alpha})`
+      ctx.beginPath()
+      ctx.moveTo(pts[i - 1].x, pts[i - 1].y)
+      ctx.lineTo(pts[i].x, pts[i].y)
+      ctx.stroke()
+    }
+  })
+}
+
+// ── Selection / targeting brackets ───────────────────────────────────────────
+
+function drawSelectionBrackets() {
+  if (!selectedEntity || !cesiumViewer) return
+
+  const pos  = selectedEntity.position?.getValue(cesiumViewer.clock.currentTime)
+  if (!pos) return
+
+  const sc = Cesium.SceneTransforms.worldToWindowCoordinates(cesiumViewer.scene, pos)
+  if (!sc) return
+
+  const { x, y } = sc
+  const t = Date.now() / 600
+  const r = 30 + Math.sin(t) * 3   // pulsing radius
+  const b = 10                       // bracket arm length
+
+  // Glowing shadow
+  ctx.shadowColor = '#ff8800'
+  ctx.shadowBlur  = 18 + Math.sin(t) * 8
+
+  // Outer circle
+  ctx.strokeStyle = `rgba(255,136,0,${0.55 + Math.sin(t) * 0.2})`
+  ctx.lineWidth   = 1.5
+  ctx.beginPath()
+  ctx.arc(x, y, r, 0, Math.PI * 2)
+  ctx.stroke()
+
+  // Corner brackets
+  ctx.strokeStyle = '#ffaa00'
+  ctx.lineWidth   = 2
+
+  const corners = [
+    [x - r, y - r, b, 0,  0,  b],   // TL
+    [x + r, y - r, -b, 0, 0,  b],   // TR
+    [x - r, y + r, b, 0,  0, -b],   // BL
+    [x + r, y + r, -b, 0, 0, -b],   // BR
+  ]
+
+  corners.forEach(([ox, oy, dx1, dy1, dx2, dy2]) => {
+    ctx.beginPath()
+    ctx.moveTo(ox + dx1, oy)
+    ctx.lineTo(ox, oy)
+    ctx.lineTo(ox, oy + dy2)
+    ctx.stroke()
+  })
+
+  // Center dot
+  ctx.fillStyle   = 'rgba(255,136,0,0.8)'
+  ctx.shadowBlur  = 0
+  ctx.beginPath()
+  ctx.arc(x, y, 2.5, 0, Math.PI * 2)
+  ctx.fill()
+
+  ctx.shadowBlur = 0
+}
+
+// ── Main render loop ──────────────────────────────────────────────────────────
+
 function loop() {
-  switch (currentMode) {
-    case 'nightvision': drawNightVision(); break
-    case 'thermal':     drawThermal();     break
-    case 'crt':         drawCRTScanlines(); break
-    case 'anime':       drawAnime();        break
-    default:
-      ctx.clearRect(0, 0, canvas.width, canvas.height)
-      break
+  // Always clear on each frame so effects don't stack
+  if (currentMode === 'normal' && !godMode && !selectedEntity && (!getTrailsFn || getTrailsFn().size === 0)) {
+    ctx.clearRect(0, 0, canvas.width, canvas.height)
+  } else {
+    switch (currentMode) {
+      case 'nightvision': drawNightVision(); break
+      case 'thermal':     drawThermal();     break
+      case 'crt':         drawCRT();         break
+      case 'anime':       drawAnime();       break
+      default:
+        ctx.clearRect(0, 0, canvas.width, canvas.height)
+    }
+    drawTrails()
+    drawGodModeBorder()
+    drawSelectionBrackets()
   }
 
-  drawGodModeOverlay()
   animFrameId = requestAnimationFrame(loop)
 }
 
-/**
- * Initialize shader system.
- */
-export function initShaders(viewer) {
+// ── Public API ────────────────────────────────────────────────────────────────
+
+export function initShaders(viewer, getTrails) {
+  cesiumViewer = viewer
+  getTrailsFn  = getTrails
   resizeCanvas()
   window.addEventListener('resize', resizeCanvas)
   loop()
@@ -230,17 +272,11 @@ export function initShaders(viewer) {
   return {
     setMode(mode) {
       currentMode = mode
-      // Update body class for CSS filter changes
-      document.body.className = document.body.className
-        .replace(/mode-\S+/g, '')
-        .trim()
-      if (mode !== 'normal') {
-        document.body.classList.add(`mode-${mode}`)
-      }
+      document.body.className = document.body.className.replace(/mode-\S+/g, '').trim()
+      if (mode !== 'normal') document.body.classList.add(`mode-${mode}`)
     },
-    setGodMode(active) {
-      godMode = active
-    },
+    setGodMode(active) { godMode = active },
+    setSelectedEntity(entity) { selectedEntity = entity },
     destroy() {
       cancelAnimationFrame(animFrameId)
       window.removeEventListener('resize', resizeCanvas)

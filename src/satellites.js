@@ -2,38 +2,31 @@ import * as Cesium from 'cesium'
 import * as satellite from 'satellite.js'
 import { satelliteIcon } from './icons.js'
 
-/**
- * Satellite tracker — CelesTrak TLE + SGP4 propagation.
- *
- * Key design: entities are updated IN-PLACE (position property mutated),
- * not destroyed/recreated on each tick. This lets viewer.trackedEntity
- * survive across position refreshes without resetting.
- */
-
 const ACTIVE_TLE_URL =
   'https://api.allorigins.win/raw?url=' +
   encodeURIComponent('https://celestrak.org/pub/TLE/active.tle')
 
 const UPDATE_INTERVAL_MS = 10_000
-const MAX_SATS = 180
+const MAX_SATS = 100  // performance cap
 
 // name → { entity, satrec, line1, line2 }
 const satMap = new Map()
-let tleRecords = []
-let updateTimer = null
+let tleRecords    = []
+let updateTimer   = null
 let godModeActive = false
+// Polyline entity for the currently-tracked satellite's orbital ground track
+let orbitalTrackEntity = null
 
 function parseTLEText(text) {
   const lines = text.split('\n').map(l => l.trim()).filter(Boolean)
   const records = []
   for (let i = 0; i + 2 < lines.length; i += 3) {
-    const name = lines[i]
+    const name  = lines[i]
     const line1 = lines[i + 1]
     const line2 = lines[i + 2]
     if (!line1.startsWith('1 ') || !line2.startsWith('2 ')) continue
-    try {
-      records.push({ name, satrec: satellite.twoline2satrec(line1, line2), line1, line2 })
-    } catch { /* skip */ }
+    try { records.push({ name, satrec: satellite.twoline2satrec(line1, line2), line1, line2 }) }
+    catch { /* skip */ }
   }
   return records
 }
@@ -51,49 +44,54 @@ function getSatPosition(satrec, date) {
 }
 
 /**
- * Update satellite positions in-place. Creates new entities for newcomers,
- * removes entities that are no longer in the list, but never re-creates
- * entities that already exist — preserving any active trackedEntity reference.
+ * Compute the next `durationMin` minutes of orbital ground track.
+ * Returns an array of Cartesian3 positions.
  */
-function updateSatellites(viewer, records, now) {
-  const icon = satelliteIcon(godModeActive)
-  const color = godModeActive ? Cesium.Color.RED : Cesium.Color.CYAN
+export function computeOrbitalTrack(satrec, startDate, durationMin = 100, stepMin = 1) {
+  const positions = []
+  for (let t = 0; t <= durationMin; t += stepMin) {
+    const d = new Date(startDate.getTime() + t * 60_000)
+    const p = getSatPosition(satrec, d)
+    if (p) positions.push(Cesium.Cartesian3.fromDegrees(p.lon, p.lat, p.alt))
+  }
+  return positions
+}
 
+function updateSatellites(viewer, records, now) {
+  const icon        = satelliteIcon(godModeActive)
+  const color       = godModeActive ? Cesium.Color.RED : Cesium.Color.CYAN
   const activeNames = new Set()
 
   records.slice(0, MAX_SATS).forEach(({ name, satrec, line1, line2 }) => {
     const pos = getSatPosition(satrec, now)
     if (!pos) return
-
     activeNames.add(name)
     const cart = Cesium.Cartesian3.fromDegrees(pos.lon, pos.lat, pos.alt)
 
     if (satMap.has(name)) {
-      // Update existing entity in-place
-      const entry = satMap.get(name)
-      entry.entity.position = new Cesium.ConstantPositionProperty(cart)
-      entry.entity.billboard.image = new Cesium.ConstantProperty(icon)
-      entry.entity.billboard.color = new Cesium.ConstantProperty(color.withAlpha(0.9))
-      entry.entity.label.show = new Cesium.ConstantProperty(godModeActive)
-      // Update properties
-      entry.entity.properties.altitude = new Cesium.ConstantProperty(Math.round(pos.alt / 1000) + ' km')
-      entry.entity.properties.lat      = new Cesium.ConstantProperty(pos.lat.toFixed(4))
-      entry.entity.properties.lon      = new Cesium.ConstantProperty(pos.lon.toFixed(4))
+      const { entity } = satMap.get(name)
+      entity.position              = new Cesium.ConstantPositionProperty(cart)
+      entity.billboard.image       = new Cesium.ConstantProperty(icon)
+      entity.billboard.color       = new Cesium.ConstantProperty(color.withAlpha(0.9))
+      entity.label.show            = new Cesium.ConstantProperty(godModeActive)
+      entity.properties.altitude   = new Cesium.ConstantProperty(Math.round(pos.alt / 1000) + ' km')
+      entity.properties.lat        = new Cesium.ConstantProperty(pos.lat.toFixed(4))
+      entity.properties.lon        = new Cesium.ConstantProperty(pos.lon.toFixed(4))
     } else {
-      // Create new entity
       const entity = viewer.entities.add({
         name,
         position: cart,
-        // Camera offset when tracked: 30km behind, 10km above the satellite
-        // viewFrom is in local ENU (East-North-Up) at the entity's surface point
-        viewFrom: new Cesium.Cartesian3(0, -30_000, 10_000),
+        // Camera sits ~80 km "above" (away from Earth) when tracking —
+        // looks down through the satellite at Earth below
+        viewFrom: new Cesium.Cartesian3(0, 0, 80_000),
         billboard: {
           image: icon,
           width: 28, height: 28,
           verticalOrigin: Cesium.VerticalOrigin.CENTER,
           color: color.withAlpha(0.9),
-          scaleByDistance: new Cesium.NearFarScalar(1e6, 1.5, 1e8, 0.4),
-          disableDepthTestDistance: Number.POSITIVE_INFINITY,
+          scaleByDistance: new Cesium.NearFarScalar(5e5, 1.8, 1e8, 0.3),
+          // 1.5e6 m threshold: depth-tested when camera is far away (occludes globe back-side)
+          disableDepthTestDistance: 1.5e6,
         },
         label: {
           text: name.trim(),
@@ -103,7 +101,7 @@ function updateSatellites(viewer, records, now) {
           outlineWidth: 2,
           style: Cesium.LabelStyle.FILL_AND_OUTLINE,
           pixelOffset: new Cesium.Cartesian2(18, -14),
-          scaleByDistance: new Cesium.NearFarScalar(1e6, 1, 5e7, 0),
+          scaleByDistance: new Cesium.NearFarScalar(5e5, 1, 5e7, 0),
           show: godModeActive,
         },
         properties: {
@@ -120,12 +118,42 @@ function updateSatellites(viewer, records, now) {
     }
   })
 
-  // Remove satellites that fell out of the active set (decayed, etc.)
-  for (const [name, entry] of satMap) {
+  for (const [name, { entity }] of satMap) {
     if (!activeNames.has(name)) {
-      viewer.entities.remove(entry.entity)
+      viewer.entities.remove(entity)
       satMap.delete(name)
     }
+  }
+}
+
+/**
+ * Show the orbital ground track for a satellite by name.
+ * Draws a polyline for the next 100 minutes of orbit.
+ */
+export function showOrbitalTrack(viewer, name) {
+  clearOrbitalTrack(viewer)
+  const entry = satMap.get(name)
+  if (!entry) return
+  const positions = computeOrbitalTrack(entry.satrec, new Date())
+  if (positions.length < 2) return
+
+  orbitalTrackEntity = viewer.entities.add({
+    polyline: {
+      positions,
+      width: 1.5,
+      material: new Cesium.PolylineDashMaterialProperty({
+        color: Cesium.Color.CYAN.withAlpha(0.5),
+        dashLength: 16,
+      }),
+      arcType: Cesium.ArcType.NONE, // straight lines in 3D space
+    },
+  })
+}
+
+export function clearOrbitalTrack(viewer) {
+  if (orbitalTrackEntity) {
+    viewer.entities.remove(orbitalTrackEntity)
+    orbitalTrackEntity = null
   }
 }
 
@@ -174,6 +202,7 @@ export async function initSatellites(viewer) {
     },
     destroy: () => {
       clearInterval(updateTimer)
+      clearOrbitalTrack(viewer)
       satMap.forEach(({ entity }) => viewer.entities.remove(entity))
       satMap.clear()
     },

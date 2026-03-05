@@ -1,18 +1,9 @@
 import * as Cesium from 'cesium'
 
-/**
- * Initialize the CesiumJS viewer.
- *
- * Imagery: ArcGIS World Imagery (free, no auth, CORS-friendly satellite photos).
- * Terrain: flat EllipsoidTerrainProvider — no Cesium Ion token needed.
- * Google 3D Tiles: layered on top when VITE_GOOGLE_MAPS_KEY is set.
- */
 export async function initViewer(containerId, googleMapsKey) {
-  // Set Ion token only if configured; otherwise skip to avoid auth errors
   const cesiumToken = import.meta.env.VITE_CESIUM_TOKEN
   if (cesiumToken) Cesium.Ion.defaultAccessToken = cesiumToken
 
-  // Build viewer with no imagery — we add it manually below
   const viewer = new Cesium.Viewer(containerId, {
     animation: false,
     baseLayerPicker: false,
@@ -25,74 +16,74 @@ export async function initViewer(containerId, googleMapsKey) {
     timeline: false,
     navigationHelpButton: false,
     navigationInstructionsInitiallyVisible: false,
-
-    // Flat terrain — works with zero credentials
     terrainProvider: new Cesium.EllipsoidTerrainProvider(),
-
-    // Disable the default Ion/ArcGIS imagery layer
     imageryProvider: false,
+    // Render at native resolution — no MSAA overhead
+    requestRenderMode: false,
   })
 
-  // ── Imagery ────────────────────────────────────────────────────
-  // ArcGIS World Imagery: free satellite photos, CORS-enabled, no key needed.
-  // fromUrl() is the non-deprecated async constructor for Cesium 1.104+.
+  // ArcGIS World Imagery — free, CORS-friendly satellite photos
   try {
     const arcgis = await Cesium.ArcGisMapServerImageryProvider.fromUrl(
       'https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer',
       { enablePickFeatures: false }
     )
     const layer = viewer.imageryLayers.addImageryProvider(arcgis)
-    // Dark tactical look without extra assets
-    layer.brightness = 0.7
-    layer.contrast = 1.1
-    layer.saturation = 0.5
+    layer.brightness = 0.72
+    layer.contrast   = 1.15
+    layer.saturation = 0.45
   } catch (e) {
-    console.warn('[Viewer] ArcGIS imagery failed, globe will be blank:', e.message)
+    console.warn('[Viewer] ArcGIS imagery failed:', e.message)
   }
 
-  // ── Google Photorealistic 3D Tiles (optional) ─────────────────
   if (googleMapsKey) {
     try {
       const tileset = await Cesium.createGooglePhotorealistic3DTileset({ key: googleMapsKey })
       viewer.scene.primitives.add(tileset)
-      viewer.scene.globe.show = false // 3D Tiles replace the globe
+      viewer.scene.globe.show = false
     } catch (e) {
       console.warn('[Viewer] Google 3D Tiles unavailable:', e.message)
     }
   }
 
-  // ── Cesium World Terrain (optional, requires Ion token) ───────
   if (cesiumToken) {
-    try {
-      viewer.terrainProvider = await Cesium.createWorldTerrainAsync()
-    } catch (e) {
-      console.warn('[Viewer] World terrain unavailable:', e.message)
-    }
+    try { viewer.terrainProvider = await Cesium.createWorldTerrainAsync() }
+    catch (e) { console.warn('[Viewer] World terrain unavailable:', e.message) }
   }
 
-  // ── Opening camera: descend from high orbit down to spy-satellite altitude ──
-  // Start position: 12,000 km above the US — Earth fills most of the view
+  // ── Camera constraints ───────────────────────────────────────────────────
+  const ctrl = viewer.scene.screenSpaceCameraController
+  ctrl.minimumZoomDistance = 300_000    // never closer than 300 km
+  ctrl.maximumZoomDistance = 25_000_000 // never further than 25,000 km
+  // Keep camera from rolling sideways — feel like a satellite always facing down
+  ctrl.enableRotate = true
+  ctrl.enableTilt   = true
+  ctrl.enableZoom   = true
+
+  // Prevent entities from being occluded by terrain (we have none anyway)
+  viewer.scene.globe.depthTestAgainstTerrain = false
+
+  // ── Opening POV ──────────────────────────────────────────────────────────
+  // Start directly above the US looking straight down (pure top-down satellite view)
   viewer.camera.setView({
-    destination: Cesium.Cartesian3.fromDegrees(-95.0, 38.0, 12_000_000),
+    destination: Cesium.Cartesian3.fromDegrees(-97.0, 38.0, 14_000_000),
     orientation: { heading: 0, pitch: Cesium.Math.toRadians(-90), roll: 0 },
   })
 
-  // After imagery loads, fly down to ~800 km spy-satellite altitude over Austin
-  // giving the feeling of a surveillance satellite descending to its target
+  // Fly down to spy-satellite altitude: ~1200km, 10° tilt so horizon is visible
   setTimeout(() => {
     viewer.camera.flyTo({
-      destination: Cesium.Cartesian3.fromDegrees(-97.7431, 30.2672, 800_000),
+      destination: Cesium.Cartesian3.fromDegrees(-97.7431, 32.0, 1_200_000),
       orientation: {
-        heading: Cesium.Math.toRadians(10),
-        pitch:   Cesium.Math.toRadians(-72),
-        roll:    0,
+        heading: 0,
+        pitch: Cesium.Math.toRadians(-82),
+        roll:  0,
       },
-      duration: 4.5,
+      duration: 4,
       easingFunction: Cesium.EasingFunction.CUBIC_IN_OUT,
     })
-  }, 800)
+  }, 600)
 
-  viewer.scene.postProcessStages.fxaa.enabled = true
   window._cesiumViewer = viewer
   return viewer
 }
