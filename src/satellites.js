@@ -81,9 +81,6 @@ function updateSatellites(viewer, records, now) {
       const entity = viewer.entities.add({
         name,
         position: cart,
-        // Camera sits ~80 km "above" (away from Earth) when tracking —
-        // looks down through the satellite at Earth below
-        viewFrom: new Cesium.Cartesian3(0, 0, 80_000),
         billboard: {
           image: icon,
           width: 28, height: 28,

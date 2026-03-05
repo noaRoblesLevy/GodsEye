@@ -18,8 +18,6 @@ export async function initViewer(containerId, googleMapsKey) {
     navigationInstructionsInitiallyVisible: false,
     terrainProvider: new Cesium.EllipsoidTerrainProvider(),
     imageryProvider: false,
-    // Render at native resolution — no MSAA overhead
-    requestRenderMode: false,
   })
 
   // ArcGIS World Imagery — free, CORS-friendly satellite photos
@@ -51,38 +49,24 @@ export async function initViewer(containerId, googleMapsKey) {
     catch (e) { console.warn('[Viewer] World terrain unavailable:', e.message) }
   }
 
-  // ── Camera constraints ───────────────────────────────────────────────────
+  // ── Camera constraints ────────────────────────────────────────────────────
   const ctrl = viewer.scene.screenSpaceCameraController
-  ctrl.minimumZoomDistance = 300_000    // never closer than 300 km
-  ctrl.maximumZoomDistance = 25_000_000 // never further than 25,000 km
-  // Keep camera from rolling sideways — feel like a satellite always facing down
-  ctrl.enableRotate = true
-  ctrl.enableTilt   = true
-  ctrl.enableZoom   = true
+  ctrl.minimumZoomDistance = 200_000    // 200 km floor
+  ctrl.maximumZoomDistance = 20_000_000 // 20,000 km ceiling
 
-  // Prevent entities from being occluded by terrain (we have none anyway)
   viewer.scene.globe.depthTestAgainstTerrain = false
 
-  // ── Opening POV ──────────────────────────────────────────────────────────
-  // Start directly above the US looking straight down (pure top-down satellite view)
+  // ── Static opening POV ────────────────────────────────────────────────────
+  // No flyTo animation — animations during tile loading cause jitter and
+  // conflict with user input. Just set a clean static spy-satellite view.
   viewer.camera.setView({
-    destination: Cesium.Cartesian3.fromDegrees(-97.0, 38.0, 14_000_000),
-    orientation: { heading: 0, pitch: Cesium.Math.toRadians(-90), roll: 0 },
+    destination: Cesium.Cartesian3.fromDegrees(-30.0, 30.0, 14_000_000),
+    orientation: {
+      heading: 0,
+      pitch: Cesium.Math.toRadians(-90),
+      roll: 0,
+    },
   })
-
-  // Fly down to spy-satellite altitude: ~1200km, 10° tilt so horizon is visible
-  setTimeout(() => {
-    viewer.camera.flyTo({
-      destination: Cesium.Cartesian3.fromDegrees(-97.7431, 32.0, 1_200_000),
-      orientation: {
-        heading: 0,
-        pitch: Cesium.Math.toRadians(-82),
-        roll:  0,
-      },
-      duration: 4,
-      easingFunction: Cesium.EasingFunction.CUBIC_IN_OUT,
-    })
-  }, 600)
 
   window._cesiumViewer = viewer
   return viewer

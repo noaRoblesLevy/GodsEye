@@ -92,11 +92,11 @@ export function initHUD({ viewer, shaders, satellites, aircraft, cctv }) {
 // ── Selection / tracking ─────────────────────────────────────────────────────
 
 function selectEntity(entity, viewer, shaders) {
-  // Auto-track the entity immediately
-  viewer.trackedEntity = entity
+  // Release any existing tracking lock before flying to new target
+  viewer.trackedEntity = undefined
+
   shaders.setSelectedEntity(entity)
 
-  // Show orbital track for satellites
   const type = entity.properties?.type?.getValue()
   if (type === 'satellite') {
     showOrbitalTrack(viewer, entity.name)
@@ -104,13 +104,27 @@ function selectEntity(entity, viewer, shaders) {
     clearOrbitalTrack(viewer)
   }
 
-  // Update HUD title
   const title = document.getElementById('hud-title')
-  title.textContent = `TRACKING: ${entity.name || 'TARGET'}`
+  title.textContent     = `TRACKING: ${entity.name || 'TARGET'}`
   title.style.color     = '#ff8800'
   title.style.animation = 'pulse-text 1.2s infinite'
 
   showInfoPanel(entity)
+
+  // Fly smoothly to entity, then engage tracking — avoids the instant
+  // viewFrom snap that occurs when trackedEntity is set from far away.
+  const pos = entity.position?.getValue(viewer.clock.currentTime)
+  if (pos) {
+    viewer.camera.flyToBoundingSphere(
+      new Cesium.BoundingSphere(pos, 600_000),
+      {
+        duration: 1.5,
+        complete: () => { viewer.trackedEntity = entity },
+      }
+    )
+  } else {
+    viewer.trackedEntity = entity
+  }
 }
 
 function deselect(viewer, shaders) {

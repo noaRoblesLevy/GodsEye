@@ -2,39 +2,34 @@ import * as Cesium from 'cesium'
 import { aircraftIcon, militaryIcon } from './icons.js'
 
 /**
- * Aircraft tracking — airplanes.live ADS-B API.
+ * Aircraft tracking — OpenSky Network (primary) + airplanes.live (fallback).
  *
- * airplanes.live is a community ADS-B network with a free, CORS-enabled API.
- * Endpoint: /v2/point/{lat}/{lon}/{radius_nm}
+ * OpenSky provides global ADS-B data including military aircraft, no auth required.
+ * Anonymous rate limit: 1 request / 10 s — we poll every 15 s so we're safe.
+ * Falls back to airplanes.live (3 regional parallel fetches) on HTTP 429 / error.
  *
- * We fire 3 parallel requests covering Americas, Europe/Africa, Asia-Pacific
- * and deduplicate by hex code, giving near-global coverage without auth.
- *
- * Field mapping (differs from OpenSky):
- *   hex        → icao24 (ICAO 24-bit address)
- *   flight     → callsign (has trailing spaces — trim it)
- *   lat / lon  → position
- *   alt_geom   → geometric altitude in FEET (convert × 0.3048 → meters)
- *   gs         → ground speed in knots
- *   track      → true heading in degrees
- *   geom_rate  → vertical rate in ft/min
- *   squawk     → transponder squawk code
- *   (no on_ground field — use alt_baro < 50 ft as ground proxy)
+ * OpenSky state array indices:
+ *   [0] icao24   [1] callsign  [5] lon       [6] lat
+ *   [7] baro_alt(m) [8] on_ground [9] velocity(m/s)
+ *   [10] true_track(°) [11] vertical_rate(m/s)
+ *   [13] geo_altitude(m)  [14] squawk
  */
 
-const BASE = 'https://api.airplanes.live/v2/point'
-const REGIONS = [
+const OPENSKY_URL = 'https://opensky-network.org/api/states/all'
+const ALT_BASE    = 'https://api.airplanes.live/v2/point'
+const ALT_REGIONS = [
   { lat: 35,  lon: -90,  r: 3000 },   // Americas
   { lat: 48,  lon: 15,   r: 3000 },   // Europe + Africa
   { lat: 20,  lon: 115,  r: 3000 },   // Asia-Pacific
 ]
-const UPDATE_INTERVAL_MS = 15_000
-const MAX_RENDER      = 500
-const MAX_TRAIL_PTS   = 4
-const FT_TO_M         = 0.3048
 
-const aircraftMap     = new Map()   // hex → { entity }
-const positionHistory = new Map()   // hex → Cartesian3[]
+const UPDATE_INTERVAL_MS = 15_000
+const MAX_RENDER         = 500
+const MAX_TRAIL_PTS      = 4
+const FT_TO_M            = 0.3048
+
+const aircraftMap     = new Map()   // icao24 → { entity }
+const positionHistory = new Map()   // icao24 → Cartesian3[]
 
 let updateTimer   = null
 let godModeActive = false
@@ -43,56 +38,104 @@ let isVisible     = true
 
 // ── Parsing ───────────────────────────────────────────────────────────────────
 
-function parseAC(ac) {
+function parseOpenSky(st) {
+  const icao24   = st[0] || ''
+  const callsign = (st[1] || icao24).trim()
+  const lon      = st[5]
+  const lat      = st[6]
+  const altM     = st[13] ?? st[7] ?? 0    // geo_altitude preferred, baro fallback
+  const onGround = st[8] === true
+  const speedMs  = st[9] || 0
+  const heading  = st[10] || 0
+  const vertRate = st[11] || 0
+  const squawk   = (st[14] || '').toString()
+
+  return {
+    icao24, callsign, lon, lat,
+    altM, altFt: altM * 3.28084,
+    onGround,
+    speedKts: speedMs * 1.944,
+    heading, vertRate, squawk,
+    type: '', desc: '', category: '',
+  }
+}
+
+function parseAL(ac) {
+  const altFt = ac.alt_geom ?? ac.alt_baro ?? 0
   return {
     icao24:   ac.hex,
     callsign: (ac.flight || ac.hex || '').trim(),
     category: ac.category || '',
     lon:      ac.lon,
     lat:      ac.lat,
-    altFt:    ac.alt_geom ?? ac.alt_baro ?? 0,
-    altM:     (ac.alt_geom ?? ac.alt_baro ?? 0) * FT_TO_M,
+    altFt,
+    altM:     altFt * FT_TO_M,
     onGround: (ac.alt_baro != null && ac.alt_baro < 50),
     speedKts: ac.gs || 0,
     heading:  ac.track || 0,
-    vertRate: ((ac.geom_rate || 0) * FT_TO_M / 60), // ft/min → m/s
+    vertRate: (ac.geom_rate || 0) * FT_TO_M / 60,
     squawk:   ac.squawk || '',
     type:     ac.t || '',
     desc:     ac.desc || '',
+    category: ac.category || '',
   }
 }
 
 function isMilitary(ac) {
-  return ac.category === 'C7' ||  // airplanes.live military category
-    ['7500','7600','7700'].includes(ac.squawk) ||
-    /^(RCH|JAKE|DARK|STING|GHOST|VIPER|HOOK|IRON|SWORD|VALOR|REACH|SPAR|EXEC)/
+  return ac.category === 'C7' ||
+    ['7500', '7600', '7700'].includes(ac.squawk) ||
+    /^(RCH|JAKE|DARK|STING|GHOST|VIPER|HOOK|IRON|SWORD|VALOR|REACH|SPAR|EXEC|MAGIC|TITAN|FURY|HAWK|EAGLE|FALCON|RAVEN|WOLF)/
       .test(ac.callsign.toUpperCase())
 }
 
 // ── Fetch ─────────────────────────────────────────────────────────────────────
 
-async function fetchRegion({ lat, lon, r }) {
-  const res = await fetch(`${BASE}/${lat}/${lon}/${r}`, {
+async function fetchOpenSky() {
+  const res = await fetch(OPENSKY_URL, {
     headers: { Accept: 'application/json' },
     cache:   'no-store',
   })
-  if (!res.ok) throw new Error(`airplanes.live ${res.status}`)
+  if (res.status === 429) throw Object.assign(new Error('Rate limited'), { code: 429 })
+  if (!res.ok)            throw new Error(`OpenSky HTTP ${res.status}`)
   const data = await res.json()
-  return data.ac || []
+  return (data.states || [])
+    .map(parseOpenSky)
+    .filter(ac => ac.lon != null && ac.lat != null && !ac.onGround && ac.altM > 30)
 }
 
-async function fetchAllAircraft() {
-  // Parallel fetch all regions, then deduplicate by hex
-  const results = await Promise.allSettled(REGIONS.map(fetchRegion))
+async function fetchAirplanesLive() {
+  const results = await Promise.allSettled(
+    ALT_REGIONS.map(({ lat, lon, r }) =>
+      fetch(`${ALT_BASE}/${lat}/${lon}/${r}`, {
+        headers: { Accept: 'application/json' },
+        cache:   'no-store',
+      })
+        .then(res => res.ok ? res.json() : Promise.reject(new Error(`AL ${res.status}`)))
+        .then(d => (d.ac || []).map(parseAL))
+    )
+  )
   const seen = new Set()
   const all  = []
   for (const r of results) {
     if (r.status !== 'fulfilled') continue
     for (const ac of r.value) {
-      if (!seen.has(ac.hex)) { seen.add(ac.hex); all.push(ac) }
+      if (!seen.has(ac.icao24)) { seen.add(ac.icao24); all.push(ac) }
     }
   }
-  return all
+  return all.filter(ac => ac.lon != null && ac.lat != null && !ac.onGround)
+}
+
+async function fetchAllAircraft() {
+  try {
+    const list = await fetchOpenSky()
+    console.log(`[Aircraft] OpenSky: ${list.length} aircraft (global)`)
+    return list
+  } catch (e) {
+    console.warn('[Aircraft] OpenSky unavailable, falling back to airplanes.live:', e.message)
+    const list = await fetchAirplanesLive()
+    console.log(`[Aircraft] airplanes.live: ${list.length} aircraft`)
+    return list
+  }
 }
 
 // ── Rendering ─────────────────────────────────────────────────────────────────
@@ -103,27 +146,21 @@ function headingToRotation(deg) {
 
 function updateAircraft(viewer, rawList) {
   const activeIds = new Set()
+  const visible   = rawList.slice(0, MAX_RENDER)
 
-  // Filter out ground traffic and entries without position, cap to MAX_RENDER
-  const visible = rawList
-    .filter(ac => ac.lat != null && ac.lon != null && !(ac.alt_baro != null && ac.alt_baro < 50))
-    .slice(0, MAX_RENDER)
-
-  visible.forEach(raw => {
-    const s = parseAC(raw)
+  visible.forEach(s => {
     if (!s.lon || !s.lat) return
 
-    const altM  = Math.max(s.altM, 150)   // ensure above terrain
+    const altM  = Math.max(s.altM, 150)
     const mil   = isMilitary(s)
     const icon  = mil ? militaryIcon(godModeActive) : aircraftIcon(godModeActive)
     const color = mil
-      ? (godModeActive ? Cesium.Color.RED  : Cesium.Color.fromCssColorString('#ff7777'))
+      ? (godModeActive ? Cesium.Color.RED    : Cesium.Color.fromCssColorString('#ff7777'))
       : (godModeActive ? Cesium.Color.ORANGE : Cesium.Color.YELLOW)
     const cart  = Cesium.Cartesian3.fromDegrees(s.lon, s.lat, altM)
 
     activeIds.add(s.icao24)
 
-    // Append to position history for trail rendering
     const hist = positionHistory.get(s.icao24) || []
     hist.push(cart)
     if (hist.length > MAX_TRAIL_PTS) hist.shift()
@@ -141,7 +178,6 @@ function updateAircraft(viewer, rawList) {
       const entity = viewer.entities.add({
         name: s.callsign || s.icao24,
         position: cart,
-        viewFrom: new Cesium.Cartesian3(0, -80_000, 20_000),
         billboard: {
           image:    icon,
           width:    mil ? 26 : 22,
@@ -179,7 +215,6 @@ function updateAircraft(viewer, rawList) {
     }
   })
 
-  // Remove aircraft that left the feed
   for (const [id, { entity }] of aircraftMap) {
     if (!activeIds.has(id)) {
       viewer.entities.remove(entity)
@@ -196,7 +231,6 @@ export async function initAircraft(viewer) {
     if (!isVisible) return
     try {
       lastStates = await fetchAllAircraft()
-      console.log(`[Aircraft] ${lastStates.length} states fetched`)
       updateAircraft(viewer, lastStates)
     } catch (e) {
       console.warn('[Aircraft] Fetch failed:', e.message)
