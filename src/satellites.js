@@ -1,77 +1,43 @@
 import * as Cesium from 'cesium'
 import * as satellite from 'satellite.js'
 
-// CelesTrak provides free TLE data for 180+ active satellites.
-// CORS proxy needed in browser context — we use a public CORS proxy or allorigins.
-const CELESTRAK_URL =
-  'https://corsproxy.io/?url=https://celestrak.org/SOCRATES/query.php' // fallback
-const CELESTRAK_ACTIVE =
-  'https://corsproxy.io/?url=https://celestrak.org/SOCRATES/query.php'
+/**
+ * Satellite tracker using CelesTrak TLE data + SGP4 propagation.
+ *
+ * CelesTrak publishes free Two-Line Element (TLE) sets for all tracked objects.
+ * The SGP4 algorithm (Simplified General Perturbations #4) propagates orbital
+ * mechanics forward in time from a TLE snapshot — same math NORAD uses.
+ *
+ * Data flow:
+ *   CelesTrak active.tle (via allorigins CORS proxy)
+ *   → parseTLEText() → array of {name, satrec}
+ *   → getSatPosition(satrec, Date) → {lon, lat, alt}
+ *   → Cesium entities updated every UPDATE_INTERVAL_MS
+ */
 
-// Use the JSON API endpoint which avoids CORS issues
-const TLE_SOURCES = [
-  {
-    name: 'Active Satellites',
-    url: 'https://corsproxy.io/?url=https://celestrak.org/SOCRATES/query.php',
-    // Primary JSON source:
-    jsonUrl: 'https://corsproxy.io/?url=https://celestrak.org/SOCRATES/query.php',
-  },
-]
-
-// CelesTrak GP data API (returns JSON)
-const CELESTRAK_GP_URL =
-  'https://corsproxy.io/?url=https://celestrak.org/SOCRATES/query.php'
-
-// We'll fetch from the CelesTrak GP endpoint which supports JSON + CORS
-const ACTIVE_SATS_URL = 'https://celestrak.org/SOCRATES/query.php'
-
-// CelesTrak endpoint with cors-anywhere or allorigins fallback
-const TLE_URL = 'https://api.allorigins.win/get?url=' +
-  encodeURIComponent('https://celestrak.org/pub/TLE/catalog.tle')
-
-// The main CelesTrak GP data API supports CORS natively
-const GP_API_URL = 'https://celestrak.org/SOCRATES/query.php'
-
-// CelesTrak JSON API — returns objects with OBJECT_NAME, TLE_LINE1, TLE_LINE2
-// The /pub/TLE/ files are plain TLE text. The /SOCRATES endpoint is for conjunction
-// The correct endpoint for active satellites as JSON:
-const CELESTRAK_JSON =
-  'https://celestrak.org/SOCRATES/query.php'
-
-// Final correct URL: CelesTrak provides CORS-friendly GP data
-// https://celestrak.org/SOCRATES/query.php -> wrong
-// Correct: https://celestrak.org/GP/GP_v2.php?GROUP=active&FORMAT=json
-// But that requires specific params. Let's use the simple TLE text + allorigins:
-const TLE_ACTIVE_TXT = 'https://api.allorigins.win/raw?url=' +
-  encodeURIComponent('https://celestrak.org/SOCRATES/query.php')
-
-// Actually the simplest reliable CORS approach for CelesTrak:
-// https://celestrak.org/SOCRATES/query.php  <- nope, that's conjunction data
-// Correct URL for active satellites TLE text:
-const ACTIVE_TLE_URL = 'https://api.allorigins.win/raw?url=' +
+// CelesTrak active satellite TLE catalog (plain text, 3 lines per sat)
+// Fetched via allorigins.win to bypass browser CORS restrictions
+const ACTIVE_TLE_URL =
+  'https://api.allorigins.win/raw?url=' +
   encodeURIComponent('https://celestrak.org/pub/TLE/active.tle')
 
-// Update interval — satellites move slowly enough that 10s is fine
-const UPDATE_INTERVAL_MS = 10_000
-
-// Max satellites to render for performance (browser GPU limit)
-const MAX_SATS = 180
+const UPDATE_INTERVAL_MS = 10_000  // 10s — sats move slowly enough
+const MAX_SATS = 180               // GPU performance ceiling
 
 let satEntities = []
 let tleRecords = []
 let updateTimer = null
-let satDataSource = null
 let godModeActive = false
 
 /**
- * Parse plain TLE text (3-line format: name, line1, line2) into records.
- * @param {string} text
- * @returns {Array<{name, satrec}>}
+ * Parse plain TLE text (name / line1 / line2 triplets) into satrec objects.
+ * satellite.twoline2satrec() converts TLE strings into the internal satrec
+ * struct that SGP4 needs.
  */
 function parseTLEText(text) {
   const lines = text.split('\n').map(l => l.trim()).filter(Boolean)
   const records = []
-  for (let i = 0; i < lines.length - 2; i += 3) {
+  for (let i = 0; i + 2 < lines.length; i += 3) {
     const name = lines[i]
     const line1 = lines[i + 1]
     const line2 = lines[i + 2]
@@ -79,54 +45,38 @@ function parseTLEText(text) {
     try {
       const satrec = satellite.twoline2satrec(line1, line2)
       records.push({ name, satrec, line1, line2 })
-    } catch (e) {
-      // skip invalid TLE
+    } catch {
+      // skip malformed TLEs
     }
   }
   return records
 }
 
 /**
- * Compute Cartesian3 position for a satellite satrec at a given Date.
- * Uses SGP4 propagation (same algorithm NORAD uses).
+ * Propagate a satellite's satrec to the given Date and return geodetic coords.
+ * Returns null if SGP4 fails (decayed orbit, bad epoch, etc.)
  */
 function getSatPosition(satrec, date) {
   const posVel = satellite.propagate(satrec, date)
-  if (!posVel || !posVel.position) return null
+  if (!posVel?.position) return null
 
-  // satellite.js returns ECI (Earth-Centered Inertial) km coords
-  // Convert to geodetic (lat/lon/alt) via GMST rotation
+  // Rotate ECI (Earth-Centered Inertial) → geodetic using Greenwich Mean Sidereal Time
   const gmst = satellite.gstime(date)
   const geo = satellite.eciToGeodetic(posVel.position, gmst)
 
-  const lon = Cesium.Math.toDegrees(geo.longitude)
-  const lat = Cesium.Math.toDegrees(geo.latitude)
-  const alt = geo.height * 1000 // km → meters
-
-  return { lon, lat, alt, posVel }
+  return {
+    lon: Cesium.Math.toDegrees(geo.longitude),
+    lat: Cesium.Math.toDegrees(geo.latitude),
+    alt: geo.height * 1000,   // km → meters
+  }
 }
 
-/**
- * Fetch TLE data from CelesTrak and parse it.
- */
-async function fetchTLEData() {
-  const response = await fetch(ACTIVE_TLE_URL, { cache: 'no-store' })
-  if (!response.ok) throw new Error(`TLE fetch failed: ${response.status}`)
-  const text = await response.text()
-  return parseTLEText(text)
-}
-
-/**
- * Create or update Cesium entities for each satellite.
- */
+/** Rebuild all satellite Cesium entities for the current time. */
 function renderSatellites(viewer, records, now) {
-  // Remove old entities
   satEntities.forEach(e => viewer.entities.remove(e))
   satEntities = []
 
-  const subset = records.slice(0, MAX_SATS)
-
-  subset.forEach(({ name, satrec, line1, line2 }) => {
+  records.slice(0, MAX_SATS).forEach(({ name, satrec, line1, line2 }) => {
     const pos = getSatPosition(satrec, now)
     if (!pos) return
 
@@ -153,7 +103,6 @@ function renderSatellites(viewer, records, now) {
         scaleByDistance: new Cesium.NearFarScalar(1e6, 1, 5e7, 0),
         show: godModeActive,
       },
-      // Store TLE for info panel
       properties: {
         type: 'satellite',
         name,
@@ -164,51 +113,21 @@ function renderSatellites(viewer, records, now) {
         line2,
       },
     })
+
     satEntities.push(entity)
   })
 }
 
-/**
- * Main satellite initializer.
- */
-export async function initSatellites(viewer) {
-  satDataSource = new Cesium.CustomDataSource('satellites')
-  viewer.dataSources.add(satDataSource)
-
-  try {
-    tleRecords = await fetchTLEData()
-    console.log(`[Satellites] Loaded ${tleRecords.length} TLE records`)
-    renderSatellites(viewer, tleRecords, new Date())
-  } catch (e) {
-    console.warn('[Satellites] TLE fetch failed, using demo data:', e.message)
-    tleRecords = getDemoTLEs()
-    renderSatellites(viewer, tleRecords, new Date())
-  }
-
-  // Update positions on interval
-  updateTimer = setInterval(() => {
-    renderSatellites(viewer, tleRecords, new Date())
-  }, UPDATE_INTERVAL_MS)
-
-  return {
-    getCount: () => Math.min(tleRecords.length, MAX_SATS),
-    setVisible: (v) => satEntities.forEach(e => (e.show = v)),
-    setGodMode: (active) => {
-      godModeActive = active
-      renderSatellites(viewer, tleRecords, new Date())
-    },
-    destroy: () => {
-      clearInterval(updateTimer)
-      satEntities.forEach(e => viewer.entities.remove(e))
-    },
-  }
+/** Fetch TLE catalog from CelesTrak. */
+async function fetchTLEData() {
+  const res = await fetch(ACTIVE_TLE_URL, { cache: 'no-store' })
+  if (!res.ok) throw new Error(`TLE fetch failed: ${res.status}`)
+  return parseTLEText(await res.text())
 }
 
-/**
- * Minimal demo TLEs for offline/fallback — ISS + a few LEO sats.
- */
+/** Fallback TLE data for offline / API failure scenarios. */
 function getDemoTLEs() {
-  const raw = `ISS (ZARYA)
+  return parseTLEText(`ISS (ZARYA)
 1 25544U 98067A   24001.50000000  .00020000  00000-0  35000-3 0  9998
 2 25544  51.6416 247.4627 0006703 130.5360 325.0288 15.50000000 00001
 HUBBLE
@@ -222,7 +141,36 @@ NOAA-20
 2 43013  98.7400  60.0000 0001000  90.0000 270.0000 14.20000000 00004
 TERRA
 1 25994U 99068A   24001.50000000  .00000020  00000-0  15000-4 0  9994
-2 25994  98.2000  70.0000 0002000  80.0000 280.0000 14.57000000 00005`
+2 25994  98.2000  70.0000 0002000  80.0000 280.0000 14.57000000 00005`)
+}
 
-  return parseTLEText(raw)
+/** Main satellite layer initializer. */
+export async function initSatellites(viewer) {
+  try {
+    tleRecords = await fetchTLEData()
+    console.log(`[Satellites] Loaded ${tleRecords.length} TLE records from CelesTrak`)
+  } catch (e) {
+    console.warn('[Satellites] CelesTrak unavailable, using demo TLEs:', e.message)
+    tleRecords = getDemoTLEs()
+  }
+
+  renderSatellites(viewer, tleRecords, new Date())
+
+  updateTimer = setInterval(
+    () => renderSatellites(viewer, tleRecords, new Date()),
+    UPDATE_INTERVAL_MS
+  )
+
+  return {
+    getCount: () => Math.min(tleRecords.length, MAX_SATS),
+    setVisible: (v) => satEntities.forEach(e => (e.show = v)),
+    setGodMode: (active) => {
+      godModeActive = active
+      renderSatellites(viewer, tleRecords, new Date())
+    },
+    destroy: () => {
+      clearInterval(updateTimer)
+      satEntities.forEach(e => viewer.entities.remove(e))
+    },
+  }
 }
